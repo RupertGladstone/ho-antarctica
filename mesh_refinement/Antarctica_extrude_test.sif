@@ -1,0 +1,183 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Test SIF: Extrude 2D refined mesh to 3D (15 layers)
+! Read BedMachine topography and map to real geometry
+! Output VTU for ParaView verification
+!
+! This is a lightweight test — no physics solver, just:
+!   1. Read topography from BedMachine
+!   2. Extrude 2D mesh to 3D
+!   3. Map to real ice geometry via StructuredMeshMapper
+!   4. Output VTU
+!
+! Yu Wang, April 2026
+! -Infinite Progress-
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!---LUA BEGIN
+! assert(loadfile('./COLD.lua'))()
+! assert(loadfile('./Antarctica.lua'))()
+!---LUA END
+
+$name = "extrude_test"
+
+Header
+  Mesh DB "." "#MESH_OUT#"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Simulation
+  Coordinate System  = Cartesian 3D
+
+  Simulation Type = Steady State
+  Steady State Min Iterations = 1
+  Steady State Max Iterations = 1
+
+  ! --- 2D-to-3D extrusion ---
+  Extruded Mesh Levels = Integer #MLEV
+
+  ! Vertical node density: denser near the bed (Coordinate 3 = 0..1)
+  ! tx=0 at bottom, tx=1 at top
+  ! "1.0 + 2.5*tx" means layer spacing ~1x at bottom, ~3.5x at top
+  Extruded Mesh Density = Variable Coordinate 3
+    Real MATC "1.0 + 2.5 * tx"
+
+  Initialize Dirichlet Conditions = Logical False
+
+  Max Output Level = 5
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Body 1 = ice sheet volume (extruded)
+Body 1
+  Equation = 1
+  Body Force = 1
+End
+
+! Body 2 = bottom surface
+Body 2
+  Equation = 2
+End
+
+! Body 3 = top surface
+Body 3
+  Equation = 2
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body Force 1
+  ! Compute lower surface from geometry
+  FS lower = Variable uppersurface, H, bedrock
+    Real lua "getlowersurface(tx[0],tx[1],tx[2])"
+
+  ! Upper surface = as read from BedMachine
+  FS upper = Variable uppersurface
+    Real lua "tx[0]"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 1: Read topography from BedMachine
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 1
+  Exec Solver = Before All
+  Equation = "Read Topography"
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy
+
+  Filename = File "#TOPOGRAPHY_DATA#"
+
+  Read full array = Logical True
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+
+  Variable 1 = File "thickness"
+  Target Variable 1 = String "H"
+  Variable 2 = File "bed"
+  Target Variable 2 = String "bedrock"
+  Variable 3 = File "surface"
+  Target Variable 3 = String "uppersurface"
+
+  Exported Variable 1 = H
+  Exported Variable 2 = bedrock
+  Exported Variable 3 = uppersurface
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 2: Compute derived surface variables
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 2
+  Exec Solver = Before All
+  Equation = "UpdateExport"
+  Procedure = "ElmerIceSolvers" "UpdateExport"
+  Variable = -nooutput dumy
+
+  Exported Variable 1 = "FS lower"
+  Exported Variable 2 = "FS upper"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 3: Map extruded mesh to real ice geometry
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 3
+  Exec Solver = Before Simulation
+  Equation = "MapCoordinate"
+  Procedure = "StructuredMeshMapper" "StructuredMeshMapper"
+
+  Active Coordinate = Integer 3
+
+  Top Surface Variable Name = String "FS upper"
+  Bottom Surface Variable Name = String "FS lower"
+
+  Dot Product Tolerance = Real 0.001
+  Displacement Mode = Logical False
+  Correct Surface = Logical True
+  Minimum Height = Real #MINH
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 4: Output 3D mesh as VTU
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 4
+  Equation = "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = $name
+  Vtu Format = Logical True
+  Binary Output = Logical True
+  Single Precision = Logical True
+  Save Geometry Ids = Logical True
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Equation 1
+  Active Solvers(4) = 1 2 3 4
+End
+
+Equation 2
+  Active Solvers(1) = 4
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Boundary Conditions
+! After extrusion, Elmer creates:
+!   BC 1 = original 2D boundary extruded (side walls = coastline)
+!   BC 2 = bottom surface
+!   BC 3 = top surface
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Boundary Condition 1
+  Name = "Coastline"
+  Target Boundaries(1) = 1
+End
+
+Boundary Condition 2
+  Name = "Bottom"
+  Body Id = 2
+  Bottom Surface = Variable bedrock
+    Real lua "tx[0]"
+End
+
+Boundary Condition 3
+  Name = "Top"
+  Body Id = 3
+  Top Surface = Variable uppersurface
+    Real lua "tx[0]"
+End

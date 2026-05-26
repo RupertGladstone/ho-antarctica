@@ -1,0 +1,223 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Antarctica S2 (3D): Extrude + project 2D variables onto 3D mesh
+!
+! Step 2 of the 2-step init pattern (Ann Kristin's approach):
+!   S1 (2D)    : Antarctica_init_S1.sif
+!   S2 (3D)    : This file - extrude 2D refined mesh to 15 layers,
+!                map geometry via StructuredMeshMapper, and project all
+!                2D variables to every layer via StructuredProjectToPlane.
+!
+! Output: a 3D Elmer .result file usable as Restart for HO inversion (S3)
+!         and the transient historic run (S4).
+!
+! Yu Wang, April 2026
+! -Infinite Progress-
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!---LUA BEGIN
+! assert(loadfile('./COLD.lua'))()
+! assert(loadfile('./Antarctica.lua'))()
+!---LUA END
+
+$name = "Antarctica_init_project_3D"
+
+Header
+  Mesh DB "." "#MESH_OUT#"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Constants
+  Sea Level = Real #zsl
+  Water Density = Real #rhoo
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Simulation
+  Coordinate System = Cartesian 3D
+  Simulation Type = Transient
+  Timestepping Method = "BDF"
+  BDF Order = 1
+  Timestep Intervals = 1
+  Timestep Sizes = 0.1
+
+  Steady State Min Iterations = 1
+  Steady State Max Iterations = 1
+
+  Output File = "$name$.result"
+
+  Max Output Level = 5
+
+  ! --- Restart from S1 (2D) ------------------------------------------
+  Restart File = "Antarctica_init_S1.result"
+  Restart Position = 0
+  Restart Before Initial Conditions = Logical True
+
+  Restart Variable 1 = thickness
+  Restart Variable 2 = bed
+  Restart Variable 3 = surface
+  Restart Variable 4 = lowersurface
+  Restart Variable 5 = vx
+  Restart Variable 6 = vy
+  Restart Variable 7 = Mu
+  Restart Variable 8 = beta
+  Restart Variable 9 = smbref
+  Restart Variable 10 = groundedmask
+
+  Initialize Dirichlet Conditions = Logical False
+
+  ! --- Extrusion ------------------------------------------------------
+  Extruded Mesh Levels = Integer #MLEV
+  Extruded Mesh Density = Variable Coordinate 1
+    Real MATC "1.0 + 2.5 * tx"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body 1
+  Name = "IceSheet"
+  Equation = 1
+  Body Force = 1
+  Material = 1
+  Initial Condition = 1
+End
+
+Body 2
+  Name = "BedrockInterface"
+  Equation = 2
+  Material = 1
+End
+
+Body 3
+  Name = "TopSurface"
+  Equation = 2
+  Material = 1
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Material 1
+  SSA Mean Density = Real #rhoi
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Initial Condition 1
+  ! Values inherited from restart; these defaults are only touched
+  ! for nodes introduced by extrusion
+  thickness    = Real 0.0
+  bed          = Real 0.0
+  surface      = Real 0.0
+  lowersurface = Real 0.0
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body Force 1
+  vobs = Variable vx, vy
+    Real lua "math.sqrt(tx[0]*tx[0] + tx[1]*tx[1])"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 1: Make 2D restart variables visible as exported variables
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 1
+  Equation = "UpdateExportedVars"
+  Procedure = "ElmerIceSolvers" "UpdateExport"
+  Variable = -nooutput dumy1
+
+  Exported Variable 1  = "thickness"
+  Exported Variable 2  = "bed"
+  Exported Variable 3  = "surface"
+  Exported Variable 4  = "lowersurface"
+  Exported Variable 5  = "vx"
+  Exported Variable 6  = "vy"
+  Exported Variable 7  = "Mu"
+  Exported Variable 8  = "beta"
+  Exported Variable 9  = "smbref"
+  Exported Variable 10 = "groundedmask"
+  Exported Variable 11 = "vobs"
+
+  Update Exported Variables = Logical True
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 2: Map extruded mesh to the actual ice geometry
+!           (lowersurface = bottom, surface = top)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 2
+  Exec Solver = "Before Simulation"
+  Equation = "MapCoordinate"
+  Procedure = "StructuredMeshMapper" "StructuredMeshMapper"
+
+  Active Coordinate = Integer 3
+
+  Top Surface Variable Name    = String "surface"
+  Bottom Surface Variable Name = String "lowersurface"
+
+  Dot Product Tolerance = Real 0.001
+  Displacement Mode = Logical False
+  Correct Surface = Logical True
+  Minimum Height = Real #MINH
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 3: Project 2D variables to every vertical level
+!           (values at the bottom get broadcast up the column)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 3
+  Equation = "Project2Dto3D"
+  Procedure = "StructuredProjectToPlane" "StructuredProjectToPlane"
+
+  Active Coordinate = Integer 3
+  Project To Everywhere = Logical True
+
+  Variable 1  = groundedmask
+  Operator 1  = bottom
+  Variable 2  = lowersurface
+  Variable 3  = surface
+  Variable 4  = thickness
+  Variable 5  = bed
+  Variable 6  = vx
+  Variable 7  = vy
+  Variable 8  = Mu
+  Variable 9  = beta
+  Variable 10 = smbref
+  Variable 11 = vobs
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 4: Save 3D result and VTU output
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 4
+  Exec Solver = "After Timestep"
+  Equation  = "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = $name
+  Vtu Format = Logical True
+  Binary Output = Logical True
+  Single Precision = Logical True
+  Save Geometry Ids = Logical True
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Equation 1
+  Active Solvers(4) = 1 2 3 4
+End
+
+Equation 2
+  Active Solvers(1) = 4
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Boundary conditions
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Boundary Condition 1
+  Name = "Coastline"
+  Target Boundaries(1) = 1
+End
+
+Boundary Condition 2
+  Name = "Bottom"
+  Body Id = 2
+End
+
+Boundary Condition 3
+  Name = "Top"
+  Body Id = 3
+End

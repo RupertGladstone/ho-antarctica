@@ -1,0 +1,15 @@
+-- ###################################################################
+-- ## Regularisation parameters for Step 5 inversions (plain Lua file).
+-- ## Loaded by both Antarctica_invert_beta_S5.sif (uses LambdaReg only)
+-- ## and Antarctica_invert_joint_S5.sif (uses all three).
+-- ##
+-- ## Loaded via   assert(loadfile('./OPTIM_BETA.IN'))()   in the SIF Lua
+-- ## block, NOT via a SIF `include` (Elmer doesn't evaluate Lua blocks
+-- ## inside included files).
+-- ##
+-- ## Sweep these for the L-curve. Start: LambdaReg = 1e6 (beta-only first).
+-- ###################################################################
+
+LambdaReg     = 1.0e6   -- Tikhonov smoothness on alpha = log10(beta)
+LambdaRegMu   = 1.0e6   -- Tikhonov smoothness on etaMu = log10(Mu/MuPrior)
+LambdaPriorMu = 1.0e3   -- Prior pull of etaMu toward etaMuPrior (=0)

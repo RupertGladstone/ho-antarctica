@@ -1,0 +1,266 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Antarctica S1: Read datasets onto 2D refined mesh
+!
+! Step 1 of a 2-step init pattern (Ann Kristin's approach):
+!   S1 (2D)    : GridDataReader for bed, surface, thickness, velocity,
+!                viscosity, beta, SMB. Compute lowersurface and grounded mask.
+!                Write restart file.
+!   S3-3D (3D) : Extrude + project variables to all levels.
+!
+! Variable naming follows Ann Kristin's convention:
+!   thickness, bed, surface, lowersurface, vx, vy, beta, smbref,
+!   groundedmask, Mu
+!
+! Yu Wang, April 2026
+! -Infinite Progress-
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!---LUA BEGIN
+! assert(loadfile('./COLD.lua'))()
+! assert(loadfile('./Antarctica.lua'))()
+!---LUA END
+
+$name = "Antarctica_init_S1"
+
+Header
+  Mesh DB "." "#MESH_OUT#"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Constants
+  Sea Level = Real #zsl
+  Water Density = Real #rhoo
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Simulation
+  Coordinate System = Cartesian 2D
+  Simulation Type = Transient
+  Timestepping Method = "BDF"
+  BDF Order = 1
+  Timestep Intervals = 1
+  Timestep Sizes = 0.1
+
+  Steady State Min Iterations = 1
+  Steady State Max Iterations = 1
+
+  Output File = "$name$.result"
+  Post File   = "$name$.vtu"
+
+  Max Output Level = 5
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body 1
+  Name = "IceSheet"
+  Equation = 1
+  Material = 1
+  Body Force = 1
+  Initial Condition = 1
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Equation 1
+  Active Solvers(8) = 1 2 3 4 5 6 7 8
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Material 1
+  SSA Mean Density = Real #rhoi
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Initial Condition 1
+  thickness    = Real 0.0
+  bed          = Real 0.0
+  surface      = Real 0.0
+  lowersurface = Real 0.0
+  vx           = Real 0.0
+  vy           = Real 0.0
+  Mu           = Real 0.0
+  beta         = Real 0.0
+  smbref       = Real 0.0
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body Force 1
+  ! lowersurface = surface - thickness
+  lowersurface = Variable surface, thickness
+    Real lua "tx[0] - tx[1]"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 1: Read ice geometry from BedMachine V4
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 1
+  Exec Solver = "Before All"
+  Equation = "Read ice geometry"
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy1
+
+  Filename = File "#TOPOGRAPHY_DATA#"
+  Read full array = Logical False
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+  X Var Name = String "x"
+  Y Var Name = String "y"
+  Epsilon X = Real 1.0e-4
+  Epsilon Y = Real 1.0e-4
+
+  Variable 1         = File "thickness"
+  Target Variable 1  = String "thickness"
+  Valid Min Value 1  = Real #MINH
+
+  Variable 2         = File "bed"
+  Target Variable 2  = String "bed"
+
+  Variable 3         = File "surface"
+  Target Variable 3  = String "surface"
+
+  Exported Variable 1 = thickness
+  Exported Variable 2 = bed
+  Exported Variable 3 = surface
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 2: Read ice viscosity (Pattyn 1994 depth-averaged)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 2
+  Exec Solver = "Before All"
+  Equation = "Read ice viscosity"
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy2
+
+  Filename = File "#VISCOSITY_DATA#"
+  Read full array = Logical False
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+
+  Variable 1         = File "Mumean"
+  Target Variable 1  = String "Mu"
+
+  Exported Variable 1 = Mu
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 3: Read basal friction parameter (beta)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 3
+  Exec Solver = "Before All"
+  Equation = "Read basal friction"
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy3
+
+  Filename = File "#SLIP_DATA#"
+  Read full array = Logical False
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+
+  Variable 1         = File "beta"
+  Target Variable 1  = String "beta"
+
+  Exported Variable 1 = beta
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 4: Read observed velocity (MEaSUREs inpainted)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 4
+  Exec Solver = "Before All"
+  Equation = "Read ice velocity"
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy4
+
+  Filename = File "#VELOCITY_DATA#"
+  Read full array = Logical False
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+  X Var Name = String "x"
+  Y Var Name = String "y"
+  Epsilon X = Real 1.0e-2
+  Epsilon Y = Real 1.0e-2
+
+  Variable 1         = File "vx"
+  Target Variable 1  = String "vx"
+  Variable 2         = File "vy"
+  Target Variable 2  = String "vy"
+
+  Exported Variable 1 = vx
+  Exported Variable 2 = vy
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 5: Read surface mass balance (MAR reference)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 5
+  Exec Solver = "Before All"
+  Equation = "Read SMB"
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy5
+
+  Filename = File "#SMB_DATA#"
+  Read full array = Logical False
+
+  X Dim Name = String "nx"
+  Y Dim Name = String "ny"
+  X Var Name = String "x_coord"
+  Y Var Name = String "y_coord"
+
+  Variable 1         = File "smbref"
+  Target Variable 1  = String "smbref"
+
+  Exported Variable 1 = smbref
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 6: Compute lowersurface via UpdateExport body-force binding
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 6
+  Equation = "UpdateExportedVars"
+  Procedure = "ElmerIceSolvers" "UpdateExport"
+  Variable = -nooutput dumy6
+
+  Exported Variable 1 = "lowersurface"
+  Update Exported Variables = Logical True
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 7: Grounded-mask (needs lowersurface + bed)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 7
+  Equation = "GroundedMask"
+  Procedure = "ElmerIceSolvers" "GroundedSolver"
+  Variable = groundedmask
+  Variable DOFs = 1
+
+  Lower Surface Variable Name = String "lowersurface"
+  Bedrock Variable = String "bed"
+
+  Toler = Real #GLTolerance
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 8: Save result (triggers .result and .vtu output)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 8
+  Exec Solver = "After Timestep"
+  Equation  = "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = $name
+  Vtu Format = Logical True
+  Binary Output = Logical True
+  Single Precision = Logical True
+  Save Geometry Ids = Logical True
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Boundary Condition — coastline
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Boundary Condition 1
+  Name = "Coastline"
+  Target Boundaries(1) = 1
+End

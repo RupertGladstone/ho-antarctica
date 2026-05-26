@@ -1,0 +1,324 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Antarctica continent mesh refinement (MMG2D)
+! Based on Chen's ISMIP6_meshRefine2kmGL.sif
+!
+! GL + ice shelves → 1 km, far inland → 25 km
+! BedMachine V4, MEaSUREs inpainted velocity
+!
+! Yu Wang, April 2026
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!---LUA BEGIN
+! assert(loadfile('./COLD.lua'))()
+! assert(loadfile('./Antarctica.lua'))()
+!---LUA END
+
+Header
+  Mesh DB "." "#MESH_IN#"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Simulation
+  Coordinate System  = Cartesian 2D
+  Simulation Type = Steady
+
+  Steady State Min Iterations = #IMAX
+  Steady State Max Iterations = #IMAX
+
+  max output level = 99
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body 1
+  Equation = 1
+  Body Force = 1
+  Initial Condition = 1
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Initial Condition 1
+  distGL = Real 9.9e15
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body Force 1
+  Mu Hmin = Variable DistGL,DistB,groundedmask
+    Real lua "setminmesh(tx[0],tx[1],tx[2])"
+  Mu Hmax = Variable DistGL,DistB,vobs,groundedmask
+    Real lua "setmaxmesh(tx[0],tx[1],tx[2],tx[3])"
+
+  Mu err =  Real #U_err
+
+  Mh Hmin = Variable DistGL,DistB,groundedmask
+    Real lua "setminmesh(tx[0],tx[1],tx[2])"
+  Mh Hmax = Variable DistGL,DistB,vobs,groundedmask
+    Real lua "setmaxmesh(tx[0],tx[1],tx[2],tx[3])"
+
+  Mh err =  Real #H_err
+
+  DistGL = Real 0.0
+  DistGL Condition = Variable GroundedMask, vobs
+    Real lua "glCondition(tx[0],tx[1],0.0)"
+
+  vobs = Variable vx, vy
+    Real lua "math.sqrt( tx[0]*tx[0] + tx[1]*tx[1] )"
+
+  ! Use floatLower (same as Chen) — pure flotation for lower surface
+  lowersurface = Variable H, bedrock
+    Real lua "floatLower(tx[0],tx[1])"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 1: Read topography from BedMachine V4
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 1
+  Equation = Reader
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy
+
+  Filename = File "#TOPOGRAPHY_DATA#"
+
+  Read full array = Logical True
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+  X Var Name = String "x"
+  Y Var Name = String "y"
+  Epsilon X = Real 1.0e-4
+  Epsilon Y = Real 1.0e-4
+
+  Variable 1 = File "thickness"
+  Target Variable 1 = String "H"
+  Variable 2 = File "bed"
+  Target Variable 2 = String "bedrock"
+  Variable 3 = File "surface"
+  Target Variable 3 = String "uppersurface"
+
+  Exported Variable 1 = H
+  Exported Variable 2 = bedrock
+  Exported Variable 3 = uppersurface
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 2: Read observed velocities (inpainted, extended)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 2
+  Equation = Reader2
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy
+
+  Filename = File "#VELOCITY_DATA#"
+
+  Read full array = Logical True
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+  X Var Name = String "x"
+  Y Var Name = String "y"
+  Epsilon X = Real 1.0e-2
+  Epsilon Y = Real 1.0e-2
+
+  Variable 1 = File "vx"
+  Target Variable 1 = String "vx"
+  Variable 2 = File "vy"
+  Target Variable 2 = String "vy"
+
+  Exported Variable 1 = "vx"
+  Exported Variable 2 = "vy"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 3: Compute derived fields (vobs, lowersurface)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 3
+  Equation = "updateExportedVars"
+  Procedure = "ElmerIceSolvers" "UpdateExport"
+  Variable = -nooutput dumy
+
+  Exported Variable 1 = "vobs"
+  Exported Variable 2 = "lowersurface"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 4: Compute grounding line mask from geometry
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 4
+  Equation = "GroundedMask"
+  Procedure = "ElmerIceSolvers" "GroundedSolver"
+  Variable = GroundedMask
+  Variable DOFs = 1
+
+  lower surface variable = string lowersurface
+  Bedrock variable = string bedrock
+
+  Toler = Real #GLTolerance
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 5: Compute distance to grounding line
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 5
+  Equation = "GLdistance"
+  Variable = distGL
+  Procedure = "DistanceSolve" "DistanceSolver1"
+  Optimize Bandwidth = logical false
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 6: Compute distance to domain boundary
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 6
+  Equation = "BoundaryDistance"
+  Variable = distB
+  Procedure = "DistanceSolve" "DistanceSolver1"
+  Optimize Bandwidth = logical false
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 7: Compute 2D nodal gradient of velocity
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 7
+  Equation = "Nodal Gradient 1"
+  Variable = -nooutput "Gradient1"
+  Variable DOFs = 2
+  Procedure = "ElmerIce_MeshAdapt2D" "Compute2DNodalGradient"
+
+  Variable Name = string "vobs"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 8: Compute anisotropic metric for velocity
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 8
+  Equation = "Metric1"
+  Procedure = "ElmerIce_MeshAdapt2D" "MMG2D_MetricAniso"
+
+  Metric Variable Name = String "Mu"
+  Hessian Variable Name = String "ddx1"
+  Gradient Name = String "Gradient1"
+  Diffusivity = Real 0.5
+
+  Linear System Solver = Direct
+  Linear System Direct Method = mumps
+  Linear System Refactorize = False
+
+  Exported Variable 1 = "Mu"
+  Exported Variable 1 DOFs = 3
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 9: Compute 2D nodal gradient of thickness
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 9
+  Equation = "Nodal Gradient 2"
+  Variable = -nooutput "Gradient2"
+  Variable DOFs = 2
+  Procedure = "ElmerIce_MeshAdapt2D" "Compute2DNodalGradient"
+  Variable Name = string "h"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 10: Compute anisotropic metric for thickness
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 10
+  Equation = "Metric2"
+  Procedure = "ElmerIce_MeshAdapt2D" "MMG2D_MetricAniso"
+
+  Metric Variable Name = String "Mh"
+  Hessian Variable Name = String "ddx2"
+  Gradient Name = String "Gradient2"
+  Diffusivity = Real 0.5
+
+  Linear System Solver = Direct
+  Linear System Direct Method = mumps
+  Linear System Refactorize = False
+
+  Exported Variable 1 = "Mh"
+  Exported Variable 1 DOFs = 3
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 11: Intersect velocity and thickness metrics
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 11
+  Equation = "Metric"
+  Procedure = "ElmerIce_MeshAdapt2D" "MMG2D_MetricIntersect"
+
+  Metric Variable Name = String "M1M2"
+  Metric 1 Variable Name = String "Mh"
+  Metric 2 Variable Name = String "Mu"
+
+  Exported Variable 1 = "M1M2"
+  Exported Variable 1 DOFs = 3
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 12: Save scalar diagnostics
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 12
+  Equation = SaveScalars
+  Procedure = "SaveData" "SaveScalars"
+  Filename = "f_#name#.dat"
+  Show Norm Index = Integer 2
+
+  Variable 1 = "Time"
+
+  Operator 2 = nodes
+
+  Variable 3 = "H"
+  Operator 3 = "int"
+
+  Variable 4 = "vobs"
+  Operator 4 = "int"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 13: MMG2D adaptive mesh refinement
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 13
+  Exec Solver = after timestep
+
+  Equation = "MMG"
+  Procedure = "ElmerIce_MeshAdapt2D" "MMG2DSolver"
+
+  Output file name = "#MESH_OUT#"
+  Metric Variable Name = String "M1M2"
+
+  MMG hmin = Real #Mminfine
+
+  MMG Angle detection = Real 0.00001
+
+  Increment Mesh Number = logical false
+
+  Release previous mesh = Logical True
+
+  Steady State Convergence Tolerance = Real #Tol
+  Steady State Min Iterations = INTEGER #IMIN
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 14: VTU output for visualization
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 14
+  Exec Solver = after timestep
+  Equation = "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = "#name#_RefineMesh"
+  Vtu Format = logical true
+  Binary Output = True
+  Single Precision = True
+  Save Geometry Ids = Logical True
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Equation 1
+  Active Solvers(14) = 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Antarctica: single closed coastline boundary
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Boundary Condition 1
+  Target Boundaries(1) = 1
+  distB = Real 0.0
+End

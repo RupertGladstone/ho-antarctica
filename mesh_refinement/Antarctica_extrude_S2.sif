@@ -1,0 +1,184 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Antarctica S2: Extrude 2D refined mesh to 3D (15 layers)
+! Reads topography directly, computes FS upper/lower,
+! maps to real geometry via StructuredMeshMapper
+!
+! Yu Wang, April 2026
+! -Infinite Progress-
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!---LUA BEGIN
+! assert(loadfile('./COLD.lua'))()
+! assert(loadfile('./Antarctica.lua'))()
+!---LUA END
+
+$name = "Antarctica_S2_extrude"
+
+Header
+  Mesh DB "." "#MESH_OUT#"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Constants
+  Sea Level = Real #zsl
+  Water Density = Real #rhoo
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Simulation
+  Coordinate System  = Cartesian 3D
+
+  Simulation Type = Steady State
+  Steady State Min Iterations = 1
+  Steady State Max Iterations = 1
+
+  Extruded Mesh Levels = Integer #MLEV
+  Extruded Mesh Density = Variable Coordinate 3
+    Real MATC "1.0 + 2.5 * tx"
+
+  Initialize Dirichlet Conditions = Logical False
+
+  Output File = "$name$.result"
+
+  Max Output Level = 5
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body 1
+  Equation = 1
+  Body Force = 1
+  Material = 1
+  Initial Condition = 1
+End
+
+Body 2
+  Equation = 2
+  Material = 1
+End
+
+Body 3
+  Equation = 2
+  Material = 1
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Material 1
+  SSA Mean Density = Real #rhoi
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Initial Condition 1
+  H = Real 0.0
+  bedrock = Real 0.0
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body Force 1
+  FS lower = Variable uppersurface, H, bedrock
+    Real lua "getlowersurface(tx[0],tx[1],tx[2])"
+
+  FS upper = Variable uppersurface
+    Real lua "tx[0]"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 1: Read topography from BedMachine V4
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 1
+  Exec Solver = Before All
+  Equation = "Read Topography"
+  Procedure = "GridDataReader" "GridDataReader"
+  Variable = -nooutput dumy
+
+  Filename = File "#TOPOGRAPHY_DATA#"
+
+  Read full array = Logical True
+
+  X Dim Name = String "x"
+  Y Dim Name = String "y"
+  X Var Name = String "x"
+  Y Var Name = String "y"
+  Epsilon X = Real 1.0e-4
+  Epsilon Y = Real 1.0e-4
+
+  Variable 1 = File "thickness"
+  Target Variable 1 = String "H"
+  Variable 2 = File "bed"
+  Target Variable 2 = String "bedrock"
+  Variable 3 = File "surface"
+  Target Variable 3 = String "uppersurface"
+
+  Exported Variable 1 = H
+  Exported Variable 2 = bedrock
+  Exported Variable 3 = uppersurface
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 2: Compute derived surface variables
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 2
+  Exec Solver = Before All
+  Equation = "UpdateExport"
+  Procedure = "ElmerIceSolvers" "UpdateExport"
+  Variable = -nooutput dumy2
+
+  Exported Variable 1 = "FS lower"
+  Exported Variable 2 = "FS upper"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 3: Map extruded mesh to real ice geometry
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 3
+  Exec Solver = Before Simulation
+  Equation = "MapCoordinate"
+  Procedure = "StructuredMeshMapper" "StructuredMeshMapper"
+
+  Active Coordinate = Integer 3
+
+  Top Surface Variable Name = String "FS upper"
+  Bottom Surface Variable Name = String "FS lower"
+
+  Dot Product Tolerance = Real 0.001
+  Displacement Mode = Logical False
+  Correct Surface = Logical True
+  Minimum Height = Real #MINH
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Solver 4: Output 3D mesh as VTU
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Solver 4
+  Equation = "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = $name
+  Vtu Format = Logical True
+  Binary Output = Logical True
+  Single Precision = Logical True
+  Save Geometry Ids = Logical True
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Equation 1
+  Active Solvers(4) = 1 2 3 4
+End
+
+Equation 2
+  Active Solvers(1) = 4
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Boundary Condition 1
+  Name = "Coastline"
+  Target Boundaries(1) = 1
+End
+
+Boundary Condition 2
+  Name = "Bottom"
+  Body Id = 2
+End
+
+Boundary Condition 3
+  Name = "Top"
+  Body Id = 3
+End

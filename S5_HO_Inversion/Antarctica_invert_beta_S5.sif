@@ -1,0 +1,503 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Antarctica Step 5: HO inversion for basal friction (beta)
+!!
+!! Adapted from elmerice/Tests/AdjointBP_ISMIP-HOM-C/INVERSION_BP.sif
+!! - Mesh: full Antarctica refined (929 K 2D × 15 layers ≈ 14 M 3D nodes)
+!! - Restart: Step 4b result (1024 per-partition antarctica_init_project_3d.result.N)
+!! - Observed velocity: vx, vy from S1 (MEaSUREs phase map)
+!! - Inversion variable: alpha = log10(beta); BC uses TenPowerA(alpha)
+!! - Forward: HydrostaticNSSolver with block GS+IDRS preconditioner (Rupert)
+!! - Adjoint: Adjoint_LinearSolver -> AdjointBP_GradientBetaSolver (custom .so)
+!!
+!! Pipeline:
+!!   1. StructuredMeshMapper (geometry: surface, lowersurface from S1)
+!!   2. HydrostaticNSSolver           -> forward HO velocity
+!!   3. Adjoint_CostContSolver        -> J = velocity misfit, dJ/du
+!!   4. Adjoint_LinearSolver          -> A^T lambda = dJ/du
+!!   5. AdjointBP_GradientBetaSolver  -> dJ/dalpha at bed (custom .so)
+!!   6. Adjoint_CostRegSolver         -> Tikhonov on alpha
+!!   7. Optimize_m1qn3Parallel        -> L-BFGS update of alpha
+!!   8. ResultOutput VTU
+!!
+!! Yu Wang, May 2026 — Step 5 first pass
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+check keywords warn
+
+!---LUA BEGIN
+! assert(loadfile('./COLD.lua'))()
+! assert(loadfile('./Antarctica_lumi.lua'))()
+! assert(loadfile('./OPTIM_BETA.IN'))()
+! niter     = 100        -- L-BFGS iterations; tune up after first L-curve
+! minbeta   = -3.0       -- lower bound on alpha = log10(beta); was -10 but that gives 10^-10 ≈ free slip → near-null mode in matrix
+!---LUA END
+
+$name = "Antarctica_invert_beta_S5"
+
+Header
+  Mesh DB "." "#MESH_OUT#"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Constants
+  Sea Level = Real #zsl
+  Water Density = Real #rhoo
+  Gravity(4) = 0 0 -1 #yearinsec
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Simulation
+  Coordinate System = Cartesian 3D
+  Simulation Type = Steady State
+
+  Steady State Min Iterations = 1
+  Steady State Max Iterations = #niter
+
+  Output File = "$name$.result"
+  Output Intervals = 5
+
+  ! --- Restart from Step 4b (3D project) ----------------------------
+  ! Relative path. Mesh2MeshSolver (Solver 12) is now "Before Simulation"
+  ! so it runs AFTER this restart and doesn't hijack the active mesh path.
+  Restart File = "antarctica_init_project_3d.result"
+  Restart Position = 0
+  Restart Before Initial Conditions = Logical True
+  Initialize Dirichlet Conditions   = Logical False
+
+  Restart Variable 1  = thickness
+  Restart Variable 2  = bed
+  Restart Variable 3  = surface
+  Restart Variable 4  = lowersurface
+  Restart Variable 5  = vx
+  Restart Variable 6  = vy
+  Restart Variable 7  = Mu
+  Restart Variable 8  = beta
+  Restart Variable 9  = smbref
+  Restart Variable 10 = groundedmask
+  Restart Variable 11 = temp_c
+
+  ! --- Extrude 2D mesh -> 3D in memory ------------------------------
+  Extruded Mesh Levels  = Integer #MLEV
+  Extruded Mesh Density = Variable Coordinate 1
+    Real MATC "1.0 + 2.5 * tx"
+
+  max output level = 5
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Bodies — three required for the inversion (bulk, top, bottom)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body 1
+  Name = "IceSheet"
+  Equation = 1
+  Body Force = 1
+  Material = 1
+  Initial Condition = 1
+End
+
+Body 2
+  Name = "TopSurface"           ! cost solver runs here
+  Equation = 2
+  Body Force = 2
+End
+
+Body 3
+  Name = "BottomSurface"        ! gradient + reg + optimizer run here
+  Equation = 3
+  Initial Condition = 2
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Initial Condition 1
+  ! After Mesh2MeshSolver (Solver 12, Before All), vx/vy/beta/mu hold
+  ! RUPERT's converged ISMIP6 SSA values. Use them as warm-start.
+  ! NOTE: Uobs should still be the MEaSUREs observation — but vx/vy got
+  ! overwritten by Rupert's converged values. For now keep Uobs = vx; if
+  ! we need the raw MEaSUREs data, will need a separate Mesh2Mesh load.
+
+  ! Warm-start HO velocity from Rupert's converged surface velocity
+  HorizontalVelocity 1 = Equals vx
+  HorizontalVelocity 2 = Equals vy
+
+  ! Cost-function target (currently same as warm-start; refine later)
+  Uobs 1 = Equals vx
+  Uobs 2 = Equals vy
+
+  ! NOTE: No `Mu = Equals mu` here. Material reads lowercase `mu` directly,
+  ! populated by Mesh2MeshSolver (Solver 12) at "Before Simulation".
+
+  ! Surface clamp (kept defensively even though MUMPS proved the matrix is
+  ! valid — for degenerate ice-shelf-edge columns with thickness < MINH,
+  ! synthesize 40 m of fake ice rather than tangle the mesh).
+  surface = Variable lowersurface, thickness
+    Real lua "tx[0] + math.max(tx[1], 40.0)"
+
+  ! Clamp Mu to avoid zero / NaN / pathological values at out-of-domain
+  ! nodes in the Pattyn-94 NetCDF fills. Without this, Job 18803438
+  ! produced velocity NRM ≈ 10^30 (matrix near-singular).
+  ! Floor: 0.05 (Elmer MPa·yr scaled units, typical ice ~0.1-1.0).
+  ! Non-self-referential (uses temp_c as a trigger).
+  Mu = Variable temp_c, Mu
+    Real lua "math.max(tx[1], 0.05)"
+
+  ! Enhancement factor — uniform 1.0; bottom-projected by Solver 3 (ProjectEF)
+  ! to create "bottom EF" which Asquare_Scaled consumes.
+  EF = Real 1.0
+End
+
+Initial Condition 2
+  ! Start the inversion from data-prior beta in log10 form.
+  ! minbeta = -3 (Lua block) floors the slip coefficient at 10^-3.
+  alpha = Variable beta
+    Real lua "math.max(math.log(math.max(tx[0], 1.0e-10))/math.log(10), minbeta)"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body Force 1
+  Flow BodyForce 1 = Real 0.0
+  Flow BodyForce 2 = Real 0.0
+  Flow BodyForce 3 = Real #gravity
+End
+
+!! Cost function (top surface): J = 0.5 * ||u_model - u_obs||^2
+Body Force 2
+  Adjoint Cost = Variable HorizontalVelocity 1, Uobs 1, HorizontalVelocity 2, Uobs 2
+    Real MATC "0.5*(tx[0]-tx[1])*(tx[0]-tx[1])+0.5*(tx[2]-tx[3])*(tx[2]-tx[3])"
+
+  Adjoint Cost der 1 = Variable HorizontalVelocity 1, Uobs 1
+    Real MATC "(tx[0]-tx[1])"
+  Adjoint Cost der 2 = Variable HorizontalVelocity 2, Uobs 2
+    Real MATC "(tx[0]-tx[1])"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Material 1
+  Density = Real #rhoi
+  Cauchy = Logical True
+
+  Viscosity Model = String "power law"
+  Viscosity Exponent = Real #m            ! 1/n, n = 3
+  ! Use Mu (capital, from Step 4b restart — Pattyn-94 fit) directly as
+  ! viscosity. Mesh2MeshSolver approach abandoned due to mesh-path hijacking
+  ! conflict with Sim-block restart. Step 4b's Mu, while not as converged as
+  ! Rupert's, is physically motivated and finite — should give a well-
+  ! conditioned matrix unlike the constant Viscosity = 1.0 placeholder.
+  Viscosity = Variable Mu
+    Real lua "tx[0]"
+
+  Critical Shear Rate = Real 1.0E-5      ! tightened from 1e-10 — clamps the strain rate floor used in Glen's law η ∝ ε̇^(-2/3) so viscosity stays bounded above. Job 18805270 saw velocity grow 2100 → 10^17 m/yr in 7 nonlinear iters — too-low floor lets η blow up at very low strain locations.
+
+  SSA Mean Density = Real #rhoi
+  Min H = Real #MINH
+  Max H = Real #MAXH
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Solvers
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!! Solver 1: Map extruded coordinates to actual ice geometry
+Solver 1
+  Exec Solver = "Before Simulation"
+  Equation = "MapCoordinate"
+  Procedure = "StructuredMeshMapper" "StructuredMeshMapper"
+  Active Coordinate = Integer 3
+  Top Surface Variable Name    = String "surface"
+  Bottom Surface Variable Name = String "lowersurface"
+  Dot Product Tolerance = Real 0.001
+  Minimum Mesh Height = Real #MINH   ! correct Elmer keyword (was "Minimum Height" — silently ignored)
+End
+
+!! Solver 2: Height + depth (per-node distance to top / bottom surface)
+!!          HydrostaticNSSolver requires "height" to be present.
+Solver 2
+  Exec Solver = "Before Simulation"
+  Equation = "HeightDepth"
+  Procedure = "StructuredProjectToPlane" "StructuredProjectToPlane"
+  Active Coordinate = Integer 3
+  Operator 1 = depth
+  Operator 2 = height
+End
+
+!! Solver 3: Project enhancement factor EF to the bed -> creates "bottom EF"
+!!          Asquare_Scaled USF in Material 1 reads this variable.
+!!          (Operator = bottom on a bulk variable named X auto-creates
+!!          a variable named "bottom X" with the bottom-layer values.)
+Solver 3
+  Exec Solver = "Before Simulation"
+  Equation = "ProjectEF"
+  Procedure = "StructuredProjectToPlane" "StructuredProjectToPlane"
+  Active Coordinate = Integer 3
+  Variable 1 = EF
+  Operator 1 = bottom
+End
+
+!! Solver 4: Forward HO (Blatter-Pattyn) velocity
+Solver 4
+  Equation = "BP Velocity"
+  Procedure = "HydrostaticNSVec" "HydrostaticNSSolver"
+  Variable = -dofs 2 "HorizontalVelocity"
+
+  Velocity Vector Name = String "Flow Solution"
+  Constant-Viscosity Start = Logical True
+  Velocity limit = Real 10000.0
+
+  Linear System Abort Not Converged = False
+
+  ! Monolithic BiCgStabL + ILU2 — MUMPS diagnostic confirmed matrix is valid
+  ! (it OOMed during factorization, not on bad entries). The block-iterative
+  ! setup of block2_idrs.sif diverged on initial residual at our scale; switch
+  ! to a robust monolithic iterative scheme that's known to work for HO.
+  Linear System Solver               = Iterative
+  Linear System Iterative Method     = BiCgStabL
+  BiCgStabl Polynomial Degree        = 4
+  Linear System Preconditioning      = ILU2
+  Linear System Convergence Tolerance = 1.0e-6
+  Linear System Max Iterations       = 5000
+  Linear System Residual Output      = 10
+  Linear System Scaling              = Logical True
+
+  Nonlinear System Max Iterations = 30
+  Nonlinear System Convergence Tolerance = 1.0e-5
+  Nonlinear System Newton After Iterations = 10
+  Nonlinear System Newton After Tolerance = 1.0e-2
+  Nonlinear System Reset Newton = Logical True
+  ! Picard relaxation: damp the update so velocity doesn't fly off when the
+  ! strain-rate-dependent viscosity kicks in at iter 2. Job 18805270 ran
+  ! iter 1 (constant viscosity start) cleanly at NRM≈2100 m/yr, then iter 2
+  ! exploded to 10^14 and grew to 10^17 by iter 7. Standard fix for HO/SSA
+  ! Picard divergence is α ≈ 0.5 (Rupert uses 1.0 with proper Newton scheme).
+  Nonlinear System Relaxation Factor = Real 0.5
+
+  Steady State Convergence Tolerance = Real 1.0e-4
+
+  Exported Variable 1 = -global CostValue
+  Exported Variable 2 = -nooutput "Velocityb"
+  Exported Variable 2 DOFs = 2
+  Exported Variable 3 = "Uobs"
+  Exported Variable 3 DOFs = 2
+  Exported Variable 4 = "EF"          ! enhancement factor (bulk, uniform 1.0)
+
+  ! Declare Flow Solution as compound 4-DOF variable (Velocity:3 + Pressure:1).
+  ! HydrostaticNSVec needs this to write the full Cauchy velocity output.
+  ! Without it: "ERROR HydrostaticNSVec: Could not find components of velocity
+  ! variable: flow solution" (Job 18803438).
+  Exported Variable 5 = Flow Solution[Velocity:3 Pressure:1]
+End
+
+!! Solver 5: Cost function (velocity misfit at top surface)
+Solver 5
+  Equation = "Cost"
+  Procedure = "ElmerIceSolvers" "Adjoint_CostContSolver"
+
+  Cost Variable Name      = String "CostValue"
+  Cost Filename           = File "Cost_$name$.dat"
+  Sensitivity Variable Name = String "Velocityb"
+End
+
+!! Solver 6: Adjoint linear system
+Solver 6
+  Equation = "Adjoint"
+  Variable = -nooutput Adjoint
+  Variable DOFs = 2
+  Procedure = "ElmerIceSolvers" "Adjoint_LinearSolver"
+
+  Direct Solver Equation Name = String "BP Velocity"
+
+  ! Match Forward HO linear solver
+  Linear System Solver               = Iterative
+  Linear System Iterative Method     = BiCgStabL
+  BiCgStabl Polynomial Degree        = 4
+  Linear System Preconditioning      = ILU2
+  Linear System Convergence Tolerance = 1.0e-6
+  Linear System Max Iterations       = 5000
+  Linear System Residual Output      = 10
+  Linear System Scaling              = Logical True
+  Linear System Abort Not Converged  = False
+End
+
+!! Solver 7: Gradient dJ/dalpha at bed (custom-compiled .so)
+Solver 7
+  Equation = "DJDalpha"
+  Procedure = File "AdjointBP_GradientBetaSolver" "AdjointBP_GradientBetaSolver"
+
+  Flow Solution Name    = String "HorizontalVelocity"
+  Adjoint Solution Name = String "Adjoint"
+  Gradient Variable Name = String "DJDalpha"
+  Reset Gradient Variable = Logical True
+
+  Exported Variable 1 = alpha
+  Exported Variable 2 = DJDalpha
+End
+
+!! Solver 8: Tikhonov regularization on alpha (smoothness)
+Solver 8
+  Equation = "Regularization"
+  Procedure = "ElmerIceSolvers" "Adjoint_CostRegSolver"
+
+  Cost Filename           = File "CostReg_$name$.dat"
+  Optimized Variable Name = String "alpha"
+  Gradient Variable Name  = String "DJDalpha"
+  Cost Variable Name      = String "CostValue"
+  Lambda                  = Real #LambdaReg
+  Reset Cost Value        = Logical False
+  A priori Regularisation = Logical False
+End
+
+!! Solver 9: L-BFGS optimizer (m1qn3, parallel)
+Solver 9
+  Equation = "Optimize_m1qn3"
+  Procedure = "ElmerIceSolvers" "Optimize_m1qn3Parallel"
+
+  Cost Variable Name      = String "CostValue"
+  Optimized Variable Name = String "alpha"
+  Gradient Variable Name  = String "DJDalpha"
+  Gradient Norm File      = File "GradientNorm_$name$.dat"
+
+  Mesh Independent = Logical FALSE
+
+  M1QN3 dxmin    = Real 1.0e-10
+  M1QN3 epsg     = Real 1.0e-6
+  M1QN3 niter    = Integer #niter
+  M1QN3 nsim     = Integer #niter
+  M1QN3 impres   = Integer 5
+  M1QN3 DIS Mode = Logical True
+  M1QN3 df1      = Real 0.5
+  M1QN3 normtype = String "dfn"
+  M1QN3 OutputFile = File "M1QN3_$name$.out"
+  M1QN3 ndz      = Integer 20
+End
+
+!! Solver 10: VTU snapshots
+Solver 10
+  Exec Solver = "After Saving"
+  Equation = "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+
+  Output File Name = $name
+  Output Format = String "vtu"
+  Vtu Format = Logical True
+  Binary Output = Logical True
+  Single Precision = Logical True
+  Save Geometry Ids = Logical True
+End
+
+!! Solver 12: Interpolate Rupert's converged ISMIP6 SSA β/μ/v from his mesh
+!!            onto ours. Provides a near-converged warm-start so the BP
+!!            nonlinear iterations don't have to start from scratch (which,
+!!            with constant Viscosity = 1.0, produced ~16 km/yr velocity
+!!            spikes — clearly nonsense).
+!!
+!!            Rupert's mesh (mesh2D_AA_ZC_1kmGL_refined) has 252 partitions;
+!!            ours has 1024. Mesh2MeshSolver handles both spatial
+!!            interpolation and partition remapping in one step.
+!!
+!!            Variables interpolated from HIST30.result:
+!!              beta (his converged β from SSA inversion)
+!!              mu   (his converged viscosity prefactor)
+!!              vx, vy (his converged surface velocity)
+!!              groundedmask, bedrock, zs, zb, h (geometry — useful aliases)
+!! (Solver 12 — Mesh2MeshSolver — removed. Tried to import Rupert's converged
+!!  ISMIP6 SSA results as warm-start, but the `Mesh = -part 252 "/abs/path"`
+!!  directive always hijacked the active mesh path and broke the Sim-block
+!!  restart for Step 4b. Reverted to Step 4b's Mu (Pattyn-94 fit) — see
+!!  Material section.)
+
+!! Solver 11: Outward unit normal vector at all boundaries.
+!!            Required by the icefront BC's "Compute Normal = Logical True"
+!!            and by HydrostaticNSSolver's traction integration. Without this,
+!!            the Normal Surface Traction term at BC 1 receives NaN normals →
+!!            NaN matrix entries → IterSolve diverges on initial residual.
+!!            Matches Rupert ISMIP6_HOtest/HO.sif Solver "Normal Vector".
+Solver 11
+  Exec Solver = "Before Simulation"
+  Equation = "Normal Vector"
+  Procedure = "ElmerIceSolvers" "ComputeNormalSolver"
+  Variable = "Normal Vector"
+  Variable DOFs = 3
+
+  ComputeAll = Logical False     ! only flag this on the bodies that need it
+  Optimize Bandwidth = Logical False
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Equations
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Equation 1
+  ! Bulk: Map + HeightDepth + ProjectEF + Forward + Adjoint + Normal + Output
+  Active Solvers(7) = 1 2 3 4 6 10 11
+  Flow Solution Name = String "Flow Solution"
+End
+
+Equation 2
+  ! Top surface: Cost only
+  Active Solvers(1) = 5
+End
+
+Equation 3
+  ! Bottom surface: Gradient + Regularisation + Optimizer
+  Active Solvers(3) = 7 8 9
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Boundary Conditions
+!!
+!! Refined mesh has one physical surface (Coastline, ID 1).
+!! After extrusion Elmer adds Bottom (auto ID 2) and Top (auto ID 3).
+!! VERIFY these IDs by inspecting the Step 4b VTU before submitting.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+! BC 1: Coastline / calving front (vertical side of extruded mesh)
+Boundary Condition 1
+  Name = "Coastline"
+  Target Boundaries(1) = 1
+
+  ! Hydrostatic ice front pressure (matches Rupert ISMIP6_HOtest/HO.sif exactly).
+  ! Second variable MUST be the SURFACE elevation (not lowersurface) — the
+  ! cryostatic term is rho_ice * g * (surface - z), the column above the point.
+  ! Using lowersurface here generated ~10 MPa spurious force at the icefront
+  ! base and killed the block-11 IDRS on the first matvec.
+  ! No outer minus sign (Elmer's Normal Surface Traction is inward-positive
+  ! in Rupert's convention; matches working continent-scale runs).
+  Normal Surface Traction = Variable Coordinate 3, surface
+    Real Lua "(math.max(rhow*math.abs(gravity)*(zsl-tx[0]),0)-rhoi*math.abs(gravity)*(tx[1]-tx[0]))"
+  Compute Normal = Logical True
+End
+
+! BC 2: Bottom (auto-generated by extrusion) — sliding + gradient
+Boundary Condition 2
+  Name = "Bottom"
+  Target Boundaries(1) = 2
+  Body Id = 3                ! attach to Body 3 for the gradient/reg/optimizer solvers
+  Bottom Surface = Equals lowersurface
+
+  ! Integration anchor for the height variable (height = 0 at bottom layer).
+  ! StructuredProjectToPlane's height/depth integrator NEEDS this BC; without it,
+  ! height becomes NaN at the boundary -> propagates into HO column integration
+  ! -> NaN matrix entries -> IterSolve diverges on first residual.
+  ! Matches Rupert ISMIP6_HOtest/HO.sif "lower_surface" BC.
+  height = Real 0.0
+
+  ! Weertman sliding with alpha = log10(beta); ElmerIceUSF::TenPowerA returns 10^alpha
+  Slip Coefficient 1 = Variable alpha
+    Real Procedure "ElmerIceUSF" "TenPowerA"
+  Slip Coefficient 2 = Variable alpha
+    Real Procedure "ElmerIceUSF" "TenPowerA"
+  Slip Coefficient derivative = Variable alpha
+    Real Procedure "ElmerIceUSF" "TenPowerA_d"
+
+  Compute Normal = Logical False
+End
+
+! BC 3: Top (auto-generated by extrusion) — cost function lives here
+Boundary Condition 3
+  Name = "Top"
+  Target Boundaries(1) = 3
+  Body Id = 2                ! attach to Body 2 for the cost solver
+  Top Surface = Equals surface
+
+  ! Integration anchor for the depth variable (depth = 0 at top layer).
+  ! Matches Rupert ISMIP6_HOtest/HO.sif "upper_surface" BC.
+  depth = Real 0.0
+  Compute Normal = Logical False
+End

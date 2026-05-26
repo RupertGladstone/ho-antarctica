@@ -1,0 +1,534 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Antarctica Step 5 (joint): HO inversion for basal friction (beta) AND
+!! ice viscosity prefactor (Mu) simultaneously, via packed L-BFGS (m1qn3).
+!!
+!! Adapted from:
+!!   - Antarctica_invert_beta_S5.sif      (this dir, single-variable)
+!!   - elmerice/Tests/AdjointBP_ISMIP-HOM-C/INVERSION_BP.sif
+!!   - lundjohansen/ASB_SSA/ASB_SSA_S3_Lsurface.sif  (packed Var/DJDVar pattern)
+!!
+!! Control vector (packed for m1qn3):
+!!   Var[alpha:1 etaMu:1]
+!!     alpha  = log10(beta)                  -- bed-only, defined on bulk (zero in interior)
+!!     etaMu  = log10(Mu / MuPrior)          -- 3D bulk perturbation around prior Mu field
+!!
+!! Gradient vector (packed, written by two split AdjointBP solvers):
+!!   DJDVar[DJDalpha:1 DJDetaMu:1]
+!!     DJDalpha written by AdjointBP_GradientBetaSolver (BC, bed nodes)
+!!     DJDetaMu  written by AdjointBP_GradientMuSolver  (bulk, all layers)
+!!
+!! Tikhonov regularisation:
+!!   Lambda     -> smoothness on alpha   (bed)        from OPTIM_BETA.IN
+!!   LambdaRegMu   -> smoothness on etaMu   (bulk)
+!!   LambdaPriorMu -> prior (||etaMu||^2) anchoring Mu to MuPrior  (bulk)
+!!
+!! Pipeline:
+!!   1.  StructuredMeshMapper                -> apply surface/lowersurface geometry
+!!   2.  UpdateMu                             -> refresh Mu = MuPrior * 10^etaMu (each iter)
+!!   3.  HydrostaticNSSolver                  -> forward HO velocity
+!!   4.  Adjoint_CostContSolver               -> J = velocity misfit at top
+!!   5.  Adjoint_LinearSolver                 -> A^T lambda = dJ/du
+!!   6.  AdjointBP_GradientBetaSolver         -> DJDalpha at bed   (custom .so)
+!!   7.  AdjointBP_GradientMuSolver           -> DJDetaMu in bulk  (custom .so)
+!!   8.  Adjoint_CostRegSolver (alpha)        -> + Tikhonov on alpha
+!!   9.  Adjoint_CostRegSolver (etaMu smooth) -> + Tikhonov on etaMu
+!!   10. Adjoint_CostRegSolver (etaMu prior)  -> + ||etaMu - 0||^2 prior
+!!   11. Optimize_m1qn3Parallel                -> L-BFGS update of Var
+!!   12. ResultOutput VTU
+!!
+!! Yu Wang, May 2026 — joint v1 draft.
+!! Sanity steps before "going big":
+!!   (a) run beta-only first (this file's parent) to confirm Adjoint_LinearSolver
+!!       converges with block2_idrs at 1024 ranks;
+!!   (b) optionally a Mu-only twin (freeze alpha) to validate the Mu chain;
+!!   (c) then this file. L-curve = 2D sweep over (Lambda, LambdaRegMu).
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+check keywords warn
+
+!---LUA BEGIN
+! assert(loadfile('./COLD.lua'))()
+! assert(loadfile('./Antarctica_lumi.lua'))()
+! assert(loadfile('./OPTIM_BETA.IN'))()
+! niter     = 100        -- L-BFGS iterations; tune up after first L-curve
+! minbeta   = -3.0       -- lower bound on alpha = log10(beta); was -10 but that gives 10^-10 ≈ free slip → near-null mode
+! mineta    = -3.0       -- lower bound on etaMu (Mu/MuPrior >= 1e-3)
+! maxeta    =  3.0       -- upper bound on etaMu (Mu/MuPrior <= 1e+3)
+!---LUA END
+
+$name = "Antarctica_invert_joint_S5"
+
+Header
+  Mesh DB "." "#MESH_OUT#"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Constants
+  Sea Level      = Real #zsl
+  Water Density  = Real #rhoo
+  Gravity(4)     = 0 0 -1 #yearinsec
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Simulation
+  Coordinate System = Cartesian 3D
+  Simulation Type   = Steady State
+
+  Steady State Min Iterations = 1
+  Steady State Max Iterations = #niter
+
+  Output File      = "$name$.result"
+  Output Intervals = 5
+
+  ! --- Restart from Step 4b (3D project) ----------------------------
+  Restart File = "antarctica_init_project_3d.result"
+  Restart Position = 0
+  Restart Before Initial Conditions = Logical True
+  Initialize Dirichlet Conditions   = Logical False
+
+  Restart Variable 1  = thickness
+  Restart Variable 2  = bed
+  Restart Variable 3  = surface
+  Restart Variable 4  = lowersurface
+  Restart Variable 5  = vx
+  Restart Variable 6  = vy
+  Restart Variable 7  = Mu
+  Restart Variable 8  = beta
+  Restart Variable 9  = smbref
+  Restart Variable 10 = groundedmask
+  Restart Variable 11 = temp_c
+
+  ! --- Extrude 2D mesh -> 3D in memory ------------------------------
+  ! Restart files don't persist topology, so the SIF must produce the
+  ! same 15-layer mesh that Step 4b extruded. Density matches Init_3D.
+  Extruded Mesh Levels  = Integer #MLEV
+  Extruded Mesh Density = Variable Coordinate 1
+    Real MATC "1.0 + 2.5 * tx"
+
+  max output level = 5
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Bodies — three required for the inversion (bulk, top, bottom)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body 1
+  Name              = "IceSheet"
+  Equation          = 1
+  Body Force        = 1
+  Material          = 1
+  Initial Condition = 1
+End
+
+Body 2
+  Name       = "TopSurface"      ! cost solver runs here
+  Equation   = 2
+  Body Force = 2
+End
+
+Body 3
+  Name              = "BottomSurface"   ! beta gradient + alpha reg run here
+  Equation          = 3
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Initial Conditions
+!!
+!! Notes:
+!!   * alpha and etaMu are bulk variables (defined on Body 1) so the packed
+!!     Var lives globally; the beta-gradient solver only writes alpha at the
+!!     bed, while interior alpha is inert (it's never read by the BC).
+!!   * MuPrior is captured once from the restart Mu and never changed.
+!!   * etaMu starts at 0 so Mu = MuPrior at iter 0 (no viscosity perturbation).
+!!   * Mu itself is RE-EVALUATED by Solver 2 (UpdateMu / UpdateExport) before
+!!     every steady-state iteration, using the Lua formula here.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Initial Condition 1
+  ! Warm-start HO state variable with observed surface velocity
+  HorizontalVelocity 1 = Equals vx
+  HorizontalVelocity 2 = Equals vy
+
+  ! Observed velocity (target for cost function)
+  Uobs 1 = Equals vx
+  Uobs 2 = Equals vy
+
+  ! Rebuild surface = lowersurface + max(thickness, MINH) so every column
+  ! has thickness >= MINH. ~32% of restart nodes have surface <= lowersurface
+  ! → 4.5 M tangled nodes → BP linear solve diverges. IC overrides restart.
+  ! Non-self-referential: only depends on lowersurface, thickness.
+  surface = Variable lowersurface, thickness
+    Real lua "tx[0] + math.max(tx[1], 40.0)"
+
+  ! --- Basal friction control --------------------------------------------
+  alpha = Variable beta
+    Real lua "math.max(math.log(math.max(tx[0], 1.0e-10))/math.log(10), minbeta)"
+
+  ! --- Viscosity prefactor control (perturbation around Mu_prior) --------
+  etaMu       = Real 0.0          ! no perturbation initially
+  etaMuPrior  = Real 0.0          ! prior target for the prior-reg term
+  MuPrior     = Equals Mu         ! snapshot of restart Pattyn-94 Mu
+
+  ! Mu is recomputed each iteration by UpdateExport using this formula
+  Mu = Variable etaMu, MuPrior
+    Real lua "tx[1] * math.pow(10, tx[0])"
+
+  ! Enhancement factor (EF) — 1.0 everywhere. Not inverted here.
+  ! Asquare_Scaled USF needs "bottom EF" (the bottom-projection of EF),
+  ! which is auto-created by a StructuredProjectToPlane solver below.
+  EF = Real 1.0
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Body Force 1
+  Flow BodyForce 1 = Real 0.0
+  Flow BodyForce 2 = Real 0.0
+  Flow BodyForce 3 = Real #gravity
+End
+
+!! Cost function (top surface): J = 0.5 * ||u_model - u_obs||^2
+Body Force 2
+  Adjoint Cost = Variable HorizontalVelocity 1, Uobs 1, HorizontalVelocity 2, Uobs 2
+    Real MATC "0.5*(tx[0]-tx[1])*(tx[0]-tx[1])+0.5*(tx[2]-tx[3])*(tx[2]-tx[3])"
+
+  Adjoint Cost der 1 = Variable HorizontalVelocity 1, Uobs 1
+    Real MATC "(tx[0]-tx[1])"
+  Adjoint Cost der 2 = Variable HorizontalVelocity 2, Uobs 2
+    Real MATC "(tx[0]-tx[1])"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Material 1
+  Density = Real #rhoi
+  Cauchy  = Logical True
+
+  Viscosity Model    = String "power law"
+  Viscosity Exponent = Real #m            ! 1/n, n = 3
+  ! Asquare_Scaled signature is (bottom_EF, mu) — see Rupert Totten_HOTest SIF.
+  ! bottom_EF is the enhancement factor projected from the bed; set to 1.0 in IC.
+  Viscosity = Variable "bottom EF", Mu
+    Real Procedure "ElmerIceUSF" "Asquare_Scaled"
+
+  ! Change-of-variable factor: d(Mu)/d(etaMu) = ln(10) * MuPrior * 10^etaMu = ln(10) * Mu
+  ! Consumed by AdjointBP_GradientMuSolver via "Viscosity derivative" keyword.
+  Viscosity derivative = Variable Mu
+    Real lua "math.log(10) * tx[0]"
+
+  Critical Shear Rate = Real 1.0E-10
+
+  SSA Mean Density = Real #rhoi
+  Min H = Real #MINH
+  Max H = Real #MAXH
+
+  Glen Allow Old Keywords    = Logical True
+  Temperature Field Variable = String "temp_c"
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Solvers
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!! Solver 1: Map extruded coordinates to actual ice geometry
+Solver 1
+  Exec Solver = "Before Simulation"
+  Equation = "MapCoordinate"
+  Procedure = "StructuredMeshMapper" "StructuredMeshMapper"
+  Active Coordinate = Integer 3
+  Top Surface Variable Name    = String "surface"
+  Bottom Surface Variable Name = String "lowersurface"
+  Dot Product Tolerance = Real 0.001
+  Minimum Mesh Height = Real #MINH   ! correct Elmer keyword (was "Minimum Height" — silently ignored)
+End
+
+!! Solver 2: Height + depth (per-node distance to top / bottom surface)
+!!          HydrostaticNSSolver requires "height" to be present.
+Solver 2
+  Exec Solver = "Before Simulation"
+  Equation = "HeightDepth"
+  Procedure = "StructuredProjectToPlane" "StructuredProjectToPlane"
+  Active Coordinate = Integer 3
+  Operator 1 = depth
+  Operator 2 = height
+End
+
+!! Solver 3: Project EF to the bed -> creates "bottom EF" (read by Asquare_Scaled).
+!!          (Operator = bottom on a bulk variable X auto-creates "bottom X".)
+Solver 3
+  Exec Solver = "Before Simulation"
+  Equation = "ProjectEF"
+  Procedure = "StructuredProjectToPlane" "StructuredProjectToPlane"
+  Active Coordinate = Integer 3
+  Variable 1 = EF
+  Operator 1 = bottom
+End
+
+!! Solver 4: Update Mu = MuPrior * 10^etaMu before each steady-state iter
+!!   * Implementation: UpdateExport re-evaluates the IC formula for Mu using
+!!     the current values of etaMu and MuPrior. This keeps Mu in sync with the
+!!     m1qn3-controlled etaMu without needing a custom Fortran solver.
+Solver 4
+  Exec Solver = "Before Simulation Iteration"
+  Equation = "UpdateMu"
+  Procedure = "SaveData" "UpdateExport"
+  Variable = -nooutput dummy_updMu
+
+  Exported Variable 1 = Mu
+End
+
+!! Solver 5: Forward HO (Blatter-Pattyn) velocity
+Solver 5
+  Equation = "BP Velocity"
+  Procedure = "HydrostaticNSVec" "HydrostaticNSSolver"
+  Variable = -dofs 2 "HorizontalVelocity"
+
+  Velocity Vector Name      = String "Flow Solution"
+  Constant-Viscosity Start  = Logical True
+  Velocity limit            = Real 10000.0
+
+  Linear System Abort Not Converged = True
+  Linear System Solver = Iterative
+  include "block2_idrs.sif"
+
+  Nonlinear System Max Iterations         = 30
+  Nonlinear System Convergence Tolerance  = 1.0e-5
+  Nonlinear System Newton After Iterations = 10
+  Nonlinear System Newton After Tolerance  = 1.0e-2
+  Nonlinear System Reset Newton            = Logical True
+
+  Steady State Convergence Tolerance = Real 1.0e-4
+
+  !!--- Variables exported on the bulk body --------------------------------
+  Exported Variable 1 = -global CostValue
+  Exported Variable 2 = -nooutput "Velocityb"
+  Exported Variable 2 DOFs = 2
+  Exported Variable 3 = "Uobs"
+  Exported Variable 3 DOFs = 2
+
+  !!--- Packed control + gradient (the m1qn3 view) -------------------------
+  Exported Variable 4 = Var[alpha:1 etaMu:1]
+  Exported Variable 5 = DJDVar[DJDalpha:1 DJDetaMu:1]
+
+  !!--- Prior fields for Mu (frozen) ---------------------------------------
+  Exported Variable 6 = MuPrior
+  Exported Variable 7 = etaMuPrior
+
+  !!--- Enhancement factor (1.0, not inverted) ----------------------------
+  Exported Variable 8 = "EF"          ! bulk; bottom-projection auto-created by Solver 4 below
+End
+
+!! Solver 6: Cost function (velocity misfit at top surface)
+Solver 6
+  Equation = "Cost"
+  Procedure = "ElmerIceSolvers" "Adjoint_CostContSolver"
+
+  Cost Variable Name        = String "CostValue"
+  Cost Filename             = File "Cost_$name$.dat"
+  Sensitivity Variable Name = String "Velocityb"
+End
+
+!! Solver 7: Adjoint linear system  (uses same precond as forward)
+Solver 7
+  Equation = "Adjoint"
+  Variable = -nooutput Adjoint
+  Variable DOFs = 2
+  Procedure = "ElmerIceSolvers" "Adjoint_LinearSolver"
+
+  Direct Solver Equation Name = String "BP Velocity"
+
+  Linear System Solver = Iterative
+  include "block2_idrs.sif"
+End
+
+!! Solver 8: dJ/dalpha  -- bed gradient (custom .so, runs on Body 3 / BC bottom)
+Solver 8
+  Equation = "DJDalpha"
+  Procedure = File "AdjointBP_GradientBetaSolver" "AdjointBP_GradientBetaSolver"
+
+  Flow Solution Name     = String "HorizontalVelocity"
+  Adjoint Solution Name  = String "Adjoint"
+  Gradient Variable Name = String "DJDalpha"
+  Reset Gradient Variable = Logical True
+End
+
+!! Solver 9: dJ/detaMu  -- bulk gradient (custom .so, runs on Body 1 / bulk)
+Solver 9
+  Equation = "DJDetaMu"
+  Procedure = File "AdjointBP_GradientMuSolver" "AdjointBP_GradientMuSolver"
+
+  Flow Solution Name     = String "HorizontalVelocity"
+  Adjoint Solution Name  = String "Adjoint"
+  Gradient Variable Name = String "DJDetaMu"
+  Reset Gradient Variable = Logical True
+End
+
+!! Solver 10: Tikhonov smoothness on alpha (bed)
+Solver 10
+  Equation = "RegAlpha"
+  Procedure = "ElmerIceSolvers" "Adjoint_CostRegSolver"
+
+  Cost Filename           = File "CostReg_alpha_$name$.dat"
+  Optimized Variable Name = String "alpha"
+  Gradient Variable Name  = String "DJDalpha"
+  Cost Variable Name      = String "CostValue"
+  Lambda                  = Real #LambdaReg
+  Reset Cost Value        = Logical False
+  A priori Regularisation = Logical False
+End
+
+!! Solver 11: Tikhonov smoothness on etaMu (bulk)
+Solver 11
+  Equation = "RegEtaMu"
+  Procedure = "ElmerIceSolvers" "Adjoint_CostRegSolver"
+
+  Cost Filename           = File "CostReg_etaMu_$name$.dat"
+  Optimized Variable Name = String "etaMu"
+  Gradient Variable Name  = String "DJDetaMu"
+  Cost Variable Name      = String "CostValue"
+  Lambda                  = Real #LambdaRegMu
+  Reset Cost Value        = Logical False
+  A priori Regularisation = Logical False
+End
+
+!! Solver 12: prior anchoring etaMu to etaMuPrior = 0 (i.e. Mu -> MuPrior)
+!!            Without this the Mu field tends to drift / alias against beta.
+Solver 12
+  Equation = "RegEtaMuPrior"
+  Procedure = "ElmerIceSolvers" "Adjoint_CostRegSolver"
+
+  Cost Filename           = File "CostReg_etaMuPrior_$name$.dat"
+  Optimized Variable Name = String "etaMu"
+  Gradient Variable Name  = String "DJDetaMu"
+  Cost Variable Name      = String "CostValue"
+  Lambda                  = Real #LambdaPriorMu
+  Reset Cost Value        = Logical False
+  A priori Regularisation = Logical True
+  A priori Value Name     = String "etaMuPrior"
+End
+
+!! Solver 13: L-BFGS optimizer on the PACKED control vector Var
+!!            m1qn3 sees one (alpha + etaMu) flat vector and one DJDVar.
+Solver 13
+  Equation = "Optimize_m1qn3"
+  Procedure = "ElmerIceSolvers" "Optimize_m1qn3Parallel"
+
+  Cost Variable Name      = String "CostValue"
+  Optimized Variable Name = String "Var"
+  Gradient Variable Name  = String "DJDVar"
+  Gradient Norm File      = File "GradientNorm_$name$.dat"
+
+  Mesh Independent = Logical FALSE
+
+  M1QN3 dxmin       = Real 1.0e-10
+  M1QN3 epsg        = Real 1.0e-6
+  M1QN3 niter       = Integer #niter
+  M1QN3 nsim        = Integer #niter
+  M1QN3 impres      = Integer 5
+  M1QN3 DIS Mode    = Logical True
+  M1QN3 df1         = Real 0.5
+  M1QN3 normtype    = String "dfn"
+  M1QN3 OutputFile  = File "M1QN3_$name$.out"
+  M1QN3 ndz         = Integer 20
+End
+
+!! Solver 14: VTU snapshots
+Solver 14
+  Exec Solver = "After Saving"
+  Equation = "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+
+  Output File Name  = $name
+  Output Format     = String "vtu"
+  Vtu Format        = Logical True
+  Binary Output     = Logical True
+  Single Precision  = Logical True
+  Save Geometry Ids = Logical True
+End
+
+!! Solver 15: Outward unit normal vector — required by icefront BC.
+!!            Without this, "Compute Normal = Logical True" on BC 1 reads NaN
+!!            normals → NaN matrix entries → IterSolve dies on initial residual.
+!!            Matches Rupert ISMIP6_HOtest/HO.sif Solver "Normal Vector".
+Solver 15
+  Exec Solver = "Before Simulation"
+  Equation = "Normal Vector"
+  Procedure = "ElmerIceSolvers" "ComputeNormalSolver"
+  Variable = "Normal Vector"
+  Variable DOFs = 3
+
+  ComputeAll = Logical False
+  Optimize Bandwidth = Logical False
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Equations
+!!   Bulk    : Map, UpdateMu, Forward, Adjoint, GradientMu, RegEtaMu(×2), m1qn3, Output, Normal
+!!   Top BC  : Cost
+!!   Bottom  : GradientBeta, RegAlpha
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Equation 1
+  ! Bulk: Map, HeightDepth, ProjectEF, UpdateMu, Forward, Adjoint,
+  !       GradientMu, RegEtaMu(×2), m1qn3, Output, NormalVector
+  Active Solvers(12) = 1 2 3 4 5 7 9 11 12 13 14 15
+  Flow Solution Name = String "Flow Solution"
+End
+
+Equation 2
+  ! Top BC: Cost only
+  Active Solvers(1) = 6
+End
+
+Equation 3
+  ! Bottom BC: GradientBeta + RegAlpha
+  Active Solvers(2) = 8 10
+End
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Boundary Conditions  (same physical-IDs as the beta-only SIF)
+!!   BC 1 : Coastline / calving front
+!!   BC 2 : Bottom (auto by extrusion) — sliding + alpha gradient anchor
+!!   BC 3 : Top    (auto by extrusion) — cost lives here
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+Boundary Condition 1
+  Name = "Coastline"
+  Target Boundaries(1) = 1
+
+  ! Hydrostatic ice front pressure (matches Rupert ISMIP6_HOtest/HO.sif exactly).
+  ! Second variable MUST be surface (top of column), NOT lowersurface; using
+  ! lowersurface gives ~10 MPa spurious force at the icefront base and kills
+  ! the block-11 IDRS on the first matvec. No outer minus sign.
+  Normal Surface Traction = Variable Coordinate 3, surface
+    Real Lua "(math.max(rhow*math.abs(gravity)*(zsl-tx[0]),0)-rhoi*math.abs(gravity)*(tx[1]-tx[0]))"
+  Compute Normal = Logical True
+End
+
+Boundary Condition 2
+  Name = "Bottom"
+  Target Boundaries(1) = 2
+  Body Id = 3                ! attach to Body 3 for the beta gradient + alpha reg
+  Bottom Surface = Equals lowersurface
+
+  ! Integration anchor for the height variable (=0 at bottom). Required by
+  ! StructuredProjectToPlane's depth/height integration; without it the
+  ! height field can be NaN at the boundary -> NaN HO matrix entries.
+  height = Real 0.0
+
+  ! Weertman sliding: Slip Coefficient = 10^alpha  via ElmerIceUSF::TenPowerA
+  Slip Coefficient 1 = Variable alpha
+    Real Procedure "ElmerIceUSF" "TenPowerA"
+  Slip Coefficient 2 = Variable alpha
+    Real Procedure "ElmerIceUSF" "TenPowerA"
+  Slip Coefficient derivative = Variable alpha
+    Real Procedure "ElmerIceUSF" "TenPowerA_d"
+
+  Compute Normal = Logical False
+End
+
+Boundary Condition 3
+  Name = "Top"
+  Target Boundaries(1) = 3
+  Body Id = 2                ! attach to Body 2 for the cost solver
+  Top Surface = Equals surface
+
+  ! Integration anchor for the depth variable (=0 at top).
+  depth = Real 0.0
+  Compute Normal = Logical False
+End
