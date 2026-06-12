@@ -38,3 +38,5 @@ For ISMIP7 we aim to test the inversion provided elsewhere in this repository.
 
 In the longer term the intention is to use cutfem for grounding line movement, and provide slip derivatives (merge with SSA code?) in order to use Newton iterations. 
 Note: the current BP solver has it's own Weertman implementation including the derivative wrt sliding velocity, but it doesn't have ice shelf maskng, so the slipcoefficient would have to be continually remasked as the GL evolves... 
+
+Currently the thickness coupling to velocity is explicit: geometry is updated outside the coupling loop. Semi implicit coupling will be tested (Clara Henry's ongoing work), but probably not for ISMIP7.
