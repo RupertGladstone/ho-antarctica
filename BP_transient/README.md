@@ -55,6 +55,11 @@ There are a couple of minor checks on array bounds and nans that don’t get tri
 I added an option for very thin shelves to the elmerice branch of the repo (in USF_Contact), but my latest runs don't need it, so feel free to use Thomas' latest elmer module on mahti, just with the BP solver itself locally compiled.
 
 
+## LUA files
+
+I copied these from Chen's directory on Mahti. They are probably the same as Chen's latest lua files on LUMI. I include them here just for completeness.
+
+
 ## Next steps
 
 For ISMIP7 we aim to test the BP inversion provided elsewhere in this repository.
