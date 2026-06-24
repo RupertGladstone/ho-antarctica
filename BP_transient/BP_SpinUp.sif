@@ -1,0 +1,587 @@
+
+!--------------------------------------------------------
+!---LUA BEGIN
+! assert(loadfile('AA_SSA.lua'))()
+! assert(loadfile('COLD.lua'))()
+!---LUA END
+
+!--------------------------------------------------------
+$name = "BP_SpinUp" ! "Higher order" aka "Blatter Pattyn" model
+!!$dt = #2592000.0 / yearinsec  ! 30 days
+!!$dt = #86400.0 / yearinsec    ! 1 day
+$dt = #8640.0 / yearinsec     ! 0.1 days
+
+!--------------------------------------------------------
+Header
+  Mesh DB "mesh2D_Antarctica_1km_refined"
+End
+
+!--------------------------------------------------------
+Constants
+  Water Density = Real #rhoo
+  Ocean Water Density = Real #rhoo
+  Ice Density = Real #rhoi
+  Sea Level = Real #zsl
+
+  Gas Constant = Real 8.314
+
+  Gravity = Real #gravity
+
+  Bottom surface Name = String "zb"
+  Grounded Mask Variable Name = String "Groundedmask"
+
+End
+
+!--------------------------------------------------------
+Simulation
+  Bandwidth optimization = Logical False
+
+  Coordinate System  = Cartesian 3D
+  Simulation Type ="Transient"
+  Simulation Timing = Logical True
+  Timestepping Method = "BDF"
+  BDF Order = 1
+
+  Timestep Intervals = 1
+  Timestep Sizes = Real $dt
+  Output Intervals = 1
+
+  Steady State Min Iterations = 1
+  Steady State Max Iterations = 1
+
+  Restart File = "AA_SSA_inv_S2_XIOS.result"
+!  Restart File = "AA_S2_NoVostok_Lsurface_6.result"
+  Restart Before Initial Conditions = logical True
+  Restart Position = 0
+
+  Restart Create Variables = Logical False
+
+  Restart Variable 1  = h
+  Restart Variable 2  = bedrock
+  Restart Variable 3  = zs
+  Restart Variable 4  = zb
+  Restart Variable 5  = alpha
+  Restart Variable 6  = mu
+  Restart Variable 7  = betam
+  Restart Variable 8  = ssavelocity
+  Restart Variable 9  = GroundedMask
+
+  Initialize Dirichlet Conditions = Logical False
+  Output File = "$name".result" !"
+  max output level = 666
+
+  Extruded Mesh Levels = Integer 12
+  Extruded mesh ratio = Real 4.0
+End
+
+!--------------------------------------------------------
+Body 1
+  Name = "ice"
+  Initial Condition = 1
+  Equation = 1
+  Material = 1
+  Body Force = 1
+End
+
+Body 2
+  Name = "lower_surface"
+  Initial Condition = 2
+  Equation = 2
+  Body Force = 2
+  Material = 2
+End
+	
+
+!--------------------------------------------------------
+Initial Condition 1
+  depth = Real 0.0
+  height = Real 0.0
+  Pressure = Real 0.0
+!  Horizontal Velocity 1 = Equals SSAvelocity 1
+!  Horizontal Velocity 2 = Equals SSAvelocity 2
+End
+
+Initial Condition 2
+End
+
+!--------------------------------------------------------
+Body Force 1
+  Flow BodyForce 1 = Real 0.0
+  Flow BodyForce 2 = Real 0.0
+  Flow BodyForce 3 = Real #gravity
+End
+
+Body Force 2
+
+!TODO: mass balance forcing goes here
+  Top Surface Accumulation = real 0.1
+  Bottom Surface Accumulation  = real 0.0
+
+  ! H internal limiters (Thickness solver)
+  H Lower Limit = Real #MINH
+!  H Upper Limit = Real #MAXH
+End
+
+!--------------------------------------------------------
+Material 1
+  sea level = Real #zsl
+  Density =  Real #rhoi
+
+  ! (I assume alpha has the same meaning as EF from Stokes inversion)
+  Viscosity Model = String "power law"
+  Viscosity Exponent = Real #m ! 1/n, where n = 3
+  Viscosity = Variable bottom alpha, bottom mu
+    Real Lua "tx[0]*tx[0]*tx[1]"
+
+!  Viscosity = Variable bottom alpha, bottom mu
+!    Real Lua "(10.0^tx[0])*tx[1]"
+
+  Minimum Viscosity = real 1.0
+
+  ! Note: this Asquare_scaled appears to be functionally equivalent
+  ! to the bespoke USF in Chen's SSA setup, and the same as the lua
+  ! function above.
+!  Viscosity = Variable bottom alpha, bottom mu
+!    Real procedure "ElmerIceUSF" "Asquare_Scaled"
+
+  Critical Shear Rate =  Real 1.0E-10 ! units: s-1
+
+  Cauchy = Logical True
+End
+
+Material 2
+  SSA Mean Density = Real #rhoi   ! The flotation solver has this name hard coded
+  Density =  Real #rhoi
+  Min H = Real #MINH
+!  Max H = Real #MAXH
+End
+
+
+!--------------------------------------------------------
+
+! Map the variable "zs" from the lower surface to the upper surface
+! (it has been read in from the restart)
+Solver 1
+!  Exec Solver = "never"
+  Exec Solver = "Before All"
+  Equation = "ProjectZSinit"
+  Procedure = File "StructuredProjectToPlane" "StructuredProjectToPlane"
+  Active Coordinate = Integer 3
+
+  Variable 1 = String "zs"
+  Operator 1 = String "bottom"
+  Variable 2 = String "alpha"
+  Operator 2 = String "bottom"
+  Variable 3 = String "mu"
+  Operator 3 = String "bottom"
+End
+
+Solver 2
+!  Exec Solver = "never"
+  Exec Solver = "Before All"
+  Equation = "MapCoordinateInit"
+  Procedure = "StructuredMeshMapper" "StructuredMeshMapper"
+  Active Coordinate = Integer 3
+  Dot Product Tolerance = Real 0.001
+  Minimum Mesh Height = Real  #MINH
+  Top Surface Variable Name = String bottom zs
+  Bottom Surface Variable Name = String zb
+End
+
+!TODO: insert solvers for reading forcing data here?
+
+Solver 3
+!  Exec Solver = "never"
+  Exec Solver = "Before TimeStep"
+  Equation = "Normal Vector"
+  Procedure = "ElmerIceSolvers" "ComputeNormalSolver"
+  Variable = "Normal Vector"
+  Variable DOFs = 3
+  ComputeAll = Logical False
+  Optimize Bandwidth = Logical False
+End
+
+!TODO: insert solver for calculating basal mass balance here?
+
+Solver 4
+  Exec Solver = "Before timestep"
+  Equation = "HeightDepth"
+  Procedure = "StructuredProjectToPlane" "StructuredProjectToPlane"
+  Active Coordinate = Integer 3
+  Operator 1 = depth
+  Operator 2 = height
+End
+
+Solver 5
+!  Exec Solver = "never"
+  Equation = "1stOrder-Stokes"
+  ! Modified version has a couple of necesary modifications (see ho_antarctic github)
+  Procedure = "HydrostaticNSVec_local" "HydrostaticNSSolver"
+!  Procedure = "HydrostaticNSVec" "HydrostaticNSSolver"
+  Variable = -dofs 2 "Horizontal Velocity"
+
+  ! Optionally populate all components to a vector (could be flow solution too).
+  ! By default USF_Sliding reads this when computing nonliearity in the slip coefficient.
+  Velocity Vector Name = String "Flow Solution"
+
+  ! to keep the BP "height" (literal height of top node, mapped to all nodes beneath)
+  ! separate from "height" from the heightdepth solver (default name would be "height"):
+  Height Variable Name = String "BPsurf"
+  
+  ! Only applies to the first iteration, helps cold start
+  Constant-Viscosity Start =  Logical True
+
+  Linear System Solver = Iterative
+!  include "block2_idrs.sif"
+
+!  Linear System Abort Not Converged = True
+  Linear System Abort Not Converged = False
+  Linear System Residual Output = Integer 20
+
+  Linear System Iterative Method = GCR
+  Linear System GCR Restart = 500
+  Linear System Max Iterations = 2000
+  Linear System Convergence Tolerance = 1.0e-6
+!  Linear System Preconditioning = ILU1
+  Linear System Preconditioning = ILUT
+  Linear System ILUT Tolerance = 1.0e-5
+
+  Nonlinear System Max Iterations = 40
+  Nonlinear System Convergence Tolerance  = 1.0e-5
+  Nonlinear System Newton After Iterations = 150
+  Nonlinear System Newton After Tolerance = 1.0e-08
+!  Nonlinear System Reset Newton = Logical True
+  Nonlinear system relaxation factor = real 0.8
+
+  Steady State Convergence Tolerance = Real 1.0e-4
+
+  ! Limit applied only to the vertical average in the modified version.
+  Velocity limit = Real 10000.0
+
+  Average Velocity Name = string BP_meanVel ! vertically averaged horizontal velocity
+
+! This is needed and must be somewhere accessible (not just surface)
+  Exported Variable 1 = -dofs 1 "freeboard"
+
+! These are for information and will be populated
+  Exported Variable 2 = -elem "Shearrate"
+  Exported Variable 3 = "Viscosity"
+!  Exported Variable 3 = -elem "Viscosity"
+
+  Exported Variable 4  = Flow Solution[Velocity:3 Pressure:1]
+
+  Exported Variable 5  = "duz"
+  Exported Variable 6  = -dofs 4 "Flow Solution Loads"
+  Exported Variable 7  = -dofs 2 BP_meanVel 
+  Exported Variable 8  = -dofs 1 zs
+  Exported Variable 9  = -dofs 1 zb
+  Exported Variable 10 = -dofs 1 Bottom zs
+  Exported Variable 11 = -dofs 1 vx
+  Exported Variable 12 = -dofs 1 vy
+  Exported Variable 13 = -dofs 1 Bedrock
+  Exported Variable 14 = -dofs 1 betam
+  Exported Variable 15 = -dofs 1 height
+  Exported Variable 16 = -dofs 1 depth
+  Exported Variable 17 = -dofs 1 alpha
+  Exported Variable 18 = -dofs 1 mu
+  Exported Variable 19 = -dofs 1 Bottom alpha
+  Exported Variable 20 = -dofs 1 Bottom mu
+  Exported Variable 21 = -dofs 2 SSAvelocity
+  Exported Variable 22 = -dofs 1 "BPsurf"
+End
+
+
+!#-----------------------------------------------------------------------
+!#                          THICKNESS SOLVER
+!#-----------------------------------------------------------------------
+!# SOLVER to compute H evolution
+!#     - input  : * SSA velocity (or vertically averaged velocity from HO solver)
+!#                * BMB
+!#                * SMB
+!#
+!#     - principal output  : * H [XXX] (nodal)
+!#     - optional  outputs : * dh/dt (H velocity) [???] (nodal)
+!#                           * element averaged surface mass balance [XXX, >0 blabla](elemental)
+!#                           * element averaged basal mass balance [XXX, >0 blabla] (elemental)
+!#-----------------------------------------------------------------------
+Solver 6
+  Exec solver = never
+  Equation = "Thickness"
+  Procedure = "ElmerIceSolvers" "ThicknessSolver"
+
+  ! primary variable
+  Variable = -dofs 1 "H"
+
+  Sub-Element GL melting = Logical True
+  GL integration points number = Integer 20
+
+  ! calculate dH/dt : elmerinternal routines
+  Calculate Velocity = Logical True
+
+  Linear System Solver = Iterative
+  Linear System Iterative Method = "BiCGStab"
+  Linear System Max Iterations = 1000
+  Linear System Convergence Tolerance = 1.0E-12
+  Linear System Abort Not Converged = Logical True
+  Linear System Residual Output = 10
+  Linear System Preconditioning = "ILU0"
+!  Linear System Preconditioning = ILUT
+!  Linear System ILUT Tolerance = 1.0e-5
+
+  Nonlinear System Max Iterations = 15
+  Nonlinear System Convergence Tolerance  = 1.0e-08
+!  Nonlinear System Relaxation Factor = 1.00
+
+  Bulk Assembly Timing = Logical True
+  Linear System Timing = Logical True
+  Linear System Timing Cumulative = Logical True
+
+  Steady State Convergence Tolerance = 1.0e-6
+
+  Stabilization Method = Stabilized
+!  Transient Stabilisation = logical true
+  Apply Dirichlet = Logical FALSE
+  Apply Limiter = Logical TRUE
+  Calculate Loads = Logical TRUE
+
+  Flow Solution Name = String "BP_meanVel"
+
+  ! secondary variables (output): averaged surface and basal mass balance
+  Compute averaged mass balances = Logical True
+
+  Exported Variable 1 = -elem acabf
+  Exported Variable 2 = -elem libmassbf
+  Exported Variable 3 = -elem FFI  !fraction of floating integration points only used for SEM3    
+  Exported Variable 4 = -dofs 2 top horizontal velocity
+  Exported Variable 5 = -dofs 1 MeanViscosity
+End
+
+!#-----------------------------------------------------------------------
+!#                          FLOTATION SOLVER
+!#-----------------------------------------------------------------------
+!# SOLVER to apply flotation
+!#     - input  : * H
+!#                * bedrock
+!#                * ice and water density
+!#
+!#     - option : * GL integration points number to increase precision when computing
+!#                  the grounded/floating area of partially floated element precision. 
+!#                  20 is choosen by consistency with SSA solver
+!#
+!#     - principal output  : * groundedmask [-1 afloat, 0 grounded, 1 grounded] (nodal)
+!#     - optional  outputs : * surface elevation (nodal)
+!#                           * ice shelf draft (nodal)
+!#                           * height above flotation (nodal)
+!#                           * ice mask [0 no ice, 1 ice] (elemental)
+!#                           * grounded fraction [] (elemental)
+!#                           * floating fraction [] (elemental)
+!#-----------------------------------------------------------------------
+Solver 7
+  Exec Solver = "never"
+!  exec solver = after timestep
+  Equation = "Flotation"
+  Procedure = "ElmerIceSolvers" "Flotation"
+
+  ! primary variable
+  Variable = GroundedMask
+
+  ! options
+  GL integration points number = Integer 20
+
+  Top Surface Name = String zs
+  Bottom Surface Name = String zb
+
+  compute ice area fractions = Logical TRUE
+
+  Exported Variable 1 = haf
+  Exported Variable 2 = meltRate
+
+  Exported Variable 3 = -elem "sftgif" 
+  Exported Variable 4 = -elem "sftgrf"  
+  Exported Variable 5 = -elem "sftflf"
+
+End
+
+! Map the variable "zs" from the lower surface to the upper surface
+! (it has been calculated on the lower surface by the flotation solver)
+Solver 8
+!  Exec Solver = "never"
+  Exec Solver = "always"
+!  Exec Solver = "After Timestep"
+  Equation = "ProjectZS"
+  Procedure = File "StructuredProjectToPlane" "StructuredProjectToPlane"
+  Active Coordinate = Integer 3
+  Variable 1 = String "zs"
+  Operator 1 = String "bottom"
+  Variable 2 = String "horizontal velocity" 
+  Operator 2 = String "top"
+  Variable 3 = String "viscosity" 
+  Operator 3 = String "int mean"
+  Target Variable 3 = MeanViscosity
+!  Target Variable 3 At Bottom = Logical True
+End
+
+Solver 9
+  Exec Solver = "never"
+!  Exec Solver = "After Timestep"
+  Equation = "MapCoordinate"
+  Procedure = File "StructuredMeshMapper" "StructuredMeshMapper"
+  Active Coordinate = Integer 3
+  Dot Product Tolerance = Real 0.001
+  Minimum Mesh Height = Real #MINH
+  Top Surface Variable Name = String bottom zs ! after being projected up through the mesh
+  Bottom Surface Variable Name = String zb
+End
+
+!TODO: Add XIOS solver(s) for outputting data on lower surface
+
+!TODO: Reduce frequency/variables output via resultoutput solver?
+!      Or turn off completely? Just need this for debugging?
+
+! I currently put two vtu output solvers here:
+! one for the bulk, one for the lower surface & ice front.
+Solver 10
+  Exec Solver = String always
+!  Exec Solver = String "after saving"
+  Equation = String "ResultOutput"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+
+  Save Geometry Ids = Logical True
+  Output File Name = File $name
+  Output Format = String "vtu"
+  Output Directory = File "VTUoutputs"
+  Show Variables = Logical True
+  Vtu Format = Logical True
+
+  Save Bulk Only = Logical True
+
+  Scalar Field 1 = String Viscosity
+  Scalar Field 2 = String ShearRate
+  Scalar Field 3 = String bottom alpha
+  Vector Field 1 = String velocity
+  Vector Field 2 = String Horizontal Velocity
+End
+
+Solver 11
+  Exec Solver = String always
+!  Exec Solver = String "after saving"
+  Equation = String "ResultOutput_ls"
+  Procedure = File "ResultOutputSolve" "ResultOutputSolver"
+
+  Save Geometry Ids = Logical True
+  Output File Name = File "$name"_ls" !"
+  Output Format = String "vtu"
+  Output Directory = File "VTUoutputs"
+  Show Variables = Logical True
+  Vtu Format = Logical True
+
+  Save Boundaries Only = Logical True
+  Save current boundary = Logical True ! mask for output solver
+  Mask Name = String "Save current boundary
+!  Mask Name = String "Save Lower"
+
+  ! Geometry and grounded mask
+  Scalar Field 1 = String bedrock
+  Scalar Field 2 = String zs
+  Scalar Field 3 = String zb
+  Scalar Field 4 = String H
+  Scalar Field 5 = String GroundedMask
+
+  ! The optimised parametres from the SSA inversion
+  Scalar Field 6 = String alpha
+  Scalar Field 7 = String betam
+
+  Scalar Field 8 = String MeanViscosity
+
+  ! Here we output the vertically averaged velocity (to which the threshold has been applied)...
+  Vector Field 1 = String BP_meanVel
+  ! ...and the actual BP solution from both top (projected down) and bottom layers.
+  Vector Field 2 = String horizontal velocity
+  Vector Field 3 = String top horizontal velocity
+End
+
+!Solver 12
+!  Exec Solver = never
+!!  Exec Solver = String always
+!!  Exec Solver = String "after saving"
+!  Equation = "saveadios"
+!  Procedure = "ADIOS2OutputSolver" "ADIOS2OutputSolver"
+!  Scalar field 1 = h
+!  Scalar field 2 = GroundedMask
+!  Vector field 1 = velocity
+!  output file name = "ADIOSout.bp"
+!End
+
+!--------------------------------------------------------
+Equation 1
+  Active Solvers(9) = 1 2 3 4 5 8 9 10 11 !12
+End
+
+Equation 2
+  Active Solvers(2) = 6 7
+End
+
+
+!--------------------------------------------------------
+Boundary Condition 1
+  Name = "icefront"
+  Target Boundaries(1)  = 1
+  Save current boundary = Logical True ! mask for output solver
+  Ice Front = Logical True ! needed for the "tiny shelf drag" option below
+  Compute Normal = Logical True
+
+  Normal Surface Traction = Variable Coordinate 3, bottom zs
+    Real Lua "-(math.max(rhow*math.abs(gravity)*(zsl - tx[0]), 0.0) - rhoi*math.abs(gravity)*(tx[1] - tx[0]))"
+
+End
+
+Boundary Condition 2
+  Name = "lower_surface"
+  Body Id = 2
+  Save current boundary = Logical True ! mask for output solver
+  Save Scalars = logical true
+  Compute Normal = Logical False
+
+  height = Real 0.0
+ 
+  Slip Coefficient 1 = Variable Coordinate 3
+    Real Procedure "ElmerIceUSF" "SlidCoef_Contact"
+  Slip Coefficient 2 = Variable Coordinate 3
+    Real Procedure "ElmerIceUSF" "SlidCoef_Contact"
+
+  ! By setting the tolerance very low we effectively
+  ! turn off the contact condition but still use the
+  ! USF_Contact routine to access the discontinuous
+  ! GL option (later replace with cutfem).
+  Test Contact Tolerance = real 1.0e-10
+
+  ! Stricter way to turn off contact checking.
+  ! Only the Slidcoef_Contact function sees this; flotation solver still updates the GL
+  Grounding line moves = Logical False
+
+  ! How to handle nodes exactly on the GL (seen by SlidCoef_Contact)
+  Grounding Line Definition = string discontinuous  
+!  Grounding Line Definition = string last grounded
+
+  ! New option (only works with "discontinuous" above) to apply drag to tiny
+  ! (single element) shelves for which runaway shear softening can go unstable.
+  Tiny shelf drag = logical true
+
+! TODO: switch to regularised Coulomb?
+!  Weertman Friction Coefficient = Real 0.1
+!  Weertman Exponent = Real 1.0
+  Sliding Law = String Weertman
+  Weertman Friction Coefficient = Variable betaM
+    Real Lua "10^tx[0]"
+  Weertman Exponent = Real #1.0/n
+  Weertman Linear Velocity = Real 0.0001
+End
+
+Boundary Condition 3
+  Name = "upper_surface"
+  Compute Normal = Logical False
+
+  depth = Real 0.0
+End
+
+!TODO: remove normal solver? Not sure if this is needed...
