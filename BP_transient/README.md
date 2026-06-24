@@ -23,7 +23,7 @@ This was with 12 extruded mesh levels with thinner layers near the bed. I expect
 
 We can't increase the resources on an existing LUMI project. If we need more core hours, which we do, we need to open a new project. We should do this sooner rather than later, to make sure we have sufficient resource for the production runs. 
 
-We currently have around 3000000 core hours left on project 462001251. 300k / 200k = approx. 15 full simulations. Given that there are other users on this project, the cheat sheet lists 6 runs this long (as well as other runs), we want to do some tier 2 and 3 runs, we'll certainly waste some hours getting it wrong, we most definitely need a new project for this.
+We currently have around 3000000 core hours left on project 462001251. 3000k / 200k = approx. 15 full simulations. Given that there are other users on this project, the cheat sheet lists 6 runs this long (as well as other runs), we want to do some tier 2 and 3 runs, we'll certainly waste some hours getting it wrong, we most definitely need a new project for this.
 
 
 #### Outputting
