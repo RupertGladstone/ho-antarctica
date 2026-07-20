@@ -49,8 +49,9 @@ Simulation
   Steady State Min Iterations = 1
   Steady State Max Iterations = 1
 
-  Restart File = "AA_SSA_inv_S2_XIOS.result"
+!  Restart File = "AA_SSA_inv_S2_XIOS.result"
 !  Restart File = "AA_S2_NoVostok_Lsurface_6.result"
+  Restart File = "AA_S2_NoVostok_Lsurface_7.result"
   Restart Before Initial Conditions = logical True
   Restart Position = 0
 
@@ -130,13 +131,14 @@ Material 1
   ! (I assume alpha has the same meaning as EF from Stokes inversion)
   Viscosity Model = String "power law"
   Viscosity Exponent = Real #m ! 1/n, where n = 3
-  Viscosity = Variable bottom alpha, bottom mu
-    Real Lua "tx[0]*tx[0]*tx[1]"
 
 !  Viscosity = Variable bottom alpha, bottom mu
-!    Real Lua "(10.0^tx[0])*tx[1]"
+!    Real Lua "tx[0]*tx[0]*tx[1]"
 
-  Minimum Viscosity = real 1.0
+  Viscosity = Variable bottom alpha, bottom mu
+    Real Lua "(10.0^tx[0])*tx[1]"
+
+!  Minimum Viscosity = real 1.0
 
   ! Note: this Asquare_scaled appears to be functionally equivalent
   ! to the bespoke USF in Chen's SSA setup, and the same as the lua
@@ -354,6 +356,7 @@ Solver 6
   Exported Variable 3 = -elem FFI  !fraction of floating integration points only used for SEM3    
   Exported Variable 4 = -dofs 2 top horizontal velocity
   Exported Variable 5 = -dofs 1 MeanViscosity
+  Exported Variable 6 = -dofs 1 MinViscosity
 End
 
 !#-----------------------------------------------------------------------
@@ -417,7 +420,11 @@ Solver 8
   Operator 2 = String "top"
   Variable 3 = String "viscosity" 
   Operator 3 = String "int mean"
+  Variable 4 = String "viscosity" 
+  Operator 4 = String "min"
   Target Variable 3 = MeanViscosity
+  Target Variable 4 = MinViscosity
+
 !  Target Variable 3 At Bottom = Logical True
 End
 
@@ -492,6 +499,7 @@ Solver 11
   Scalar Field 7 = String betam
 
   Scalar Field 8 = String MeanViscosity
+  Scalar Field 9 = String MinViscosity
 
   ! Here we output the vertically averaged velocity (to which the threshold has been applied)...
   Vector Field 1 = String BP_meanVel

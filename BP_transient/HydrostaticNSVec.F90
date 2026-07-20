@@ -1042,25 +1042,26 @@ CONTAINS
 !------------------------------------------------------------------------------
 ! Compute vector for computing du_z/dz and corresponding weight.
 !------------------------------------------------------------------------------
-  SUBROUTINE LocalDuz(Element, n, ntot, duz, wuz, FirstElem, ub, dpr )
+  SUBROUTINE LocalDuz(Element, n, ntot, duz, wuz, FirstElem, ub, bsa, dpr )
 !------------------------------------------------------------------------------
     USE LinearForms
     IMPLICIT NONE
 
     TYPE(Element_t), POINTER, INTENT(IN) :: Element
     INTEGER, INTENT(IN) :: n, ntot
-    REAL(KIND=dp), POINTER :: duz(:), wuz(:), ub(:)
+    REAL(KIND=dp), POINTER :: duz(:), wuz(:), ub(:), bsa(:)
     LOGICAL :: FirstElem
     REAL(KIND=dp), POINTER, OPTIONAL :: dpr(:)
 !------------------------------------------------------------------------------
     INTEGER :: dim, dofs
     TYPE(GaussIntegrationPoints_t) :: IP
     REAL(KIND=dp), POINTER :: muVec(:)
+    TYPE(ValueList_t), POINTER :: BodyForce
     TYPE(Nodes_t) :: Nodes
-    LOGICAL :: Stat, Found, DoVisc
+    LOGICAL :: Stat, Found, DoVisc, GotBSA
     INTEGER :: NodalPerm(ntot)
     REAL(KIND=dp) :: NodalVelo(2,ntot), duz_elem(ntot), wuz_elem(ntot), dp_elem(ntot), ub_elem(ntot), &
-        vgrad(2), w, velo(2), zgrad(2)
+        bsa_elem(ntot), NodalBSA(ntot), bsa_ip, vgrad(2), w, velo(2), zgrad(2)
     REAL(KIND=dp), ALLOCATABLE, SAVE :: BasisVec(:,:), dBasisdxVec(:,:,:), DetJVec(:)
     INTEGER :: t, i, j, k, ngp, allocstat
 
@@ -1109,17 +1110,49 @@ CONTAINS
     ! Get the velocity at nodes
     CALL GetLocalSolution( NodalVelo )
 
+    ! Get the nodal basal mass balance (Body Force property, same keyword and sign
+    ! convention as read by ThicknessSolver: positive = mass gain/accretion at the
+    ! base). Used below to correct the basal kinematic vertical velocity, which
+    ! otherwise only accounts for advection along the bed slope (u.grad(bed)) and
+    ! silently ignores basal melting/accretion.
+    BodyForce => GetBodyForce(Element)
+    NodalBSA = 0.0_dp
+    GotBSA = .FALSE.
+    IF( ASSOCIATED(BodyForce) ) THEN
+      NodalBSA(1:n) = ListGetReal( BodyForce, 'Bottom Surface Accumulation', &
+          n, Element % NodeIndexes, GotBSA )
+    END IF
+
+    ! Report which of the three cases applies, once per solver call (using the
+    ! first active element as a proxy - Body Force is uniform across the body).
+    IF( FirstElem ) THEN
+      IF( .NOT. ASSOCIATED(BodyForce) ) THEN
+        CALL Info('HydrostaticNSVec', &
+            'Body Force not associated: basal vertical velocity will NOT include '// &
+            'a Bottom Surface Accumulation correction', Level=4)
+      ELSE IF( .NOT. GotBSA ) THEN
+        CALL Info('HydrostaticNSVec', &
+            'Body Force present but "Bottom Surface Accumulation" not found: basal '// &
+            'vertical velocity will NOT include a Bottom Surface Accumulation correction', Level=4)
+      ELSE
+        CALL Info('HydrostaticNSVec', &
+            '"Bottom Surface Accumulation" found: including it in the basal '// &
+            'vertical velocity calculation', Level=4)
+      END IF
+    END IF
+
     ! Return the effective viscosity. Currently only non-newtonian models supported.
     IF(DoVisc) THEN
       dp_elem = 0.0_dp
       muvec => EffectiveViscosityVec( ngp, ntot, BasisVec, dBasisdxVec, Element, NodalVelo, &
           InitHandles = FirstElem )
     END IF
-      
+
     duz_elem = 0.0_dp
     wuz_elem = 0.0_dp
     ub_elem = 0.0_dp
-    
+    bsa_elem = 0.0_dp
+
     DO t = 1, ngp
       DO i = 1, 2
         vgrad(i) = SUM(dBasisdxVec(t,1:ntot,i)*NodalVelo(i,1:ntot))
@@ -1128,6 +1161,7 @@ CONTAINS
         velo(i) = SUM(BasisVec(t,1:ntot)*NodalVelo(i,1:ntot))
         zgrad(i) = SUM(dBasisdxVec(t,1:ntot,i)*Nodes % z(1:ntot))
       END DO
+      bsa_ip = SUM(BasisVec(t,1:ntot)*NodalBSA(1:ntot))
       DO i=1,ntot
         ! It would seem that weighting with the DetJ would make sense, but maybe not...
         !w = DetJVec(t) * BasisVec(t,i)
@@ -1138,10 +1172,11 @@ CONTAINS
         wuz_elem(i) = wuz_elem(i) + w
 
         ub_elem(i) = ub_elem(i) + w * SUM(velo*zgrad)
-        
+        bsa_elem(i) = bsa_elem(i) + w * bsa_ip
+
         ! This adds the correction to pressure from equation (5.63)
         IF(DoVisc) THEN
-          dp_elem(i) = dp_elem(i) - w * 2 * muvec(t) * SUM(vgrad(1:2)) 
+          dp_elem(i) = dp_elem(i) - w * 2 * muvec(t) * SUM(vgrad(1:2))
         END IF
       END DO
     END DO
@@ -1154,6 +1189,7 @@ CONTAINS
     wuz(NodalPerm(1:ntot)) = wuz(NodalPerm(1:ntot)) + wuz_elem(1:ntot)
 
     ub(NodalPerm(1:ntot)) = ub(NodalPerm(1:ntot)) + ub_elem(1:ntot)
+    bsa(NodalPerm(1:ntot)) = bsa(NodalPerm(1:ntot)) + bsa_elem(1:ntot)
     
     IF( DoVisc ) THEN
       dpr(NodalPerm(1:ntot)) = dpr(NodalPerm(1:ntot)) + dp_elem(1:ntot)
@@ -1175,7 +1211,7 @@ CONTAINS
     TYPE(ValueList_t), POINTER :: Params, Material
     TYPE(Mesh_t), POINTER :: Mesh
     LOGICAL :: Found, PressureCorr, BaseVelo, LimitVelocity=.FALSE.
-    REAL(KIND=dp), POINTER :: duz(:), wuz(:), dpr(:), ub(:)
+    REAL(KIND=dp), POINTER :: duz(:), wuz(:), dpr(:), ub(:), bsa(:)
     INTEGER :: i,j,k,j1,j2,i1,i2,k1,k2,t,n,nd,nb,active, dofs, pdof, zdof, idx
     INTEGER(INT64) :: ibits
     TYPE(Element_t), POINTER :: Element
@@ -1184,7 +1220,7 @@ CONTAINS
     REAL(KIND=dp), POINTER :: gWork(:,:)
     
     
-    SAVE :: duz, wuz, dpr, ub
+    SAVE :: duz, wuz, dpr, ub, bsa
 
     CALL Info('HydrostaticNSVec','Populating derived fields: vertial velocity and pressure')
     
@@ -1294,34 +1330,35 @@ CONTAINS
     BaseVelo = .TRUE.
         
     n = SIZE(VarXY % Values) / 2
-    ALLOCATE(duz(n),wuz(n),ub(n))      
+    ALLOCATE(duz(n),wuz(n),ub(n),bsa(n))
     duz = 0.0_dp
     wuz = 0.0_dp
     ub = 0.0_dp
-          
+    bsa = 0.0_dp
+
     IF(PressureCorr) THEN
       ALLOCATE(dpr(n))
       dpr = 0.0_dp
     END IF
-      
+
     Active = GetNOFActive()
     DO t=1,Active
       Element => GetActiveElement(t)
       n  = GetElementNOFNodes(Element)
       nb = GetElementNOFBDOFs(Element)
       nd = GetElementNOFDOFs(Element)
-      
+
       ! Calculate elemental contribution to d(uz)/dz
       !---------------------------------------------
-      IF( PressureCorr ) THEN 
-        CALL LocalDuz(Element, n, n, duz, wuz, t==1, ub, dpr )      
+      IF( PressureCorr ) THEN
+        CALL LocalDuz(Element, n, n, duz, wuz, t==1, ub, bsa, dpr )
       ELSE
-        CALL LocalDuz(Element, n, n, duz, wuz, t==1, ub ) 
+        CALL LocalDuz(Element, n, n, duz, wuz, t==1, ub, bsa )
       END IF
-        
+
       IF(t==1) THEN
         Material => GetMaterial(Element)
-        rho = ListGetCReal(Material,'Density',UnfoundFatal=.TRUE.) 
+        rho = ListGetCReal(Material,'Density',UnfoundFatal=.TRUE.)
       END IF
     END DO
 
@@ -1330,6 +1367,7 @@ CONTAINS
       CALL ParallelSumNodalVector( Mesh, wuz, VarXY % Perm )
       CALL ParallelSumNodalVector( Mesh, duz, VarXY % Perm )
       CALL ParallelSumNodalVector( Mesh, ub, VarXY % Perm )
+      CALL ParallelSumNodalVector( Mesh, bsa, VarXY % Perm )
       IF( PressureCorr ) THEN
         CALL ParallelSumNodalVector( Mesh, dpr, VarXY % Perm )
       END IF
@@ -1340,6 +1378,9 @@ CONTAINS
     END WHERE
     WHERE(wuz > EPSILON(dz) )
       ub = ub / wuz
+    END WHERE
+    WHERE(wuz > EPSILON(dz) )
+      bsa = bsa / wuz
     END WHERE
     IF(PressureCorr) THEN
       WHERE( wuz > EPSILON(dz))
@@ -1361,7 +1402,10 @@ CONTAINS
         ! Initailize values at the bedrock
         k1 = VarFull % Perm(i1)
         IF(k1>0) THEN
-          VarFull % Values(dofs*(k1-1)+zdof) = 1.0_dp * ub(k1) 
+          ! w_base = u.grad(bed) + Bottom Surface Accumulation, matching the
+          ! sign convention ThicknessSolver uses for the same Body Force
+          ! keyword (Source = SMB + BMB, positive = mass gain/accretion).
+          VarFull % Values(dofs*(k1-1)+zdof) = 1.0_dp * ub(k1) + bsa(k1)
         END IF
           
         DO WHILE(.TRUE.)

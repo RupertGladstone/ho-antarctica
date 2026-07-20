@@ -50,6 +50,8 @@ Simulation
   Steady State Min Iterations = 1
   Steady State Max Iterations = 1
 
+! Note that you can also restart directly from an SSA inversion, it just takes
+! longer to spin up the velocity solve in first timestep, see BP_SpinUp.sif.
   Restart File = "BP_S10_L10.result"
   Restart Before Initial Conditions = logical True
   Restart Position = 0
@@ -60,8 +62,25 @@ Simulation
   Output File = "$name".result" !"
   max output level = 666
 
-  Extruded Mesh Levels = Integer 10
-  Extruded mesh ratio = Real 4.0
+!  Extruded Mesh Levels = Integer 10
+!  Extruded mesh ratio = Real 4.0
+
+! ElmerSolver only calls the mesh extrusion routine at all if some keyword with
+! the prefix "Extruded Mesh" is present (see ElmerSolver.F90). "Extruded Mesh
+! Levels"/"Extruded Mesh Layers" would also satisfy this, but if present they
+! make ExtrudedDivision use plain uniform/geometric division and silently
+! ignore Extruded Elements/Limits/Ratios below. "Extruded Mesh Rotational"
+! triggers extrusion without affecting that division logic.
+  Extruded Mesh Rotational = Logical False
+
+! Split the vertical mesh into two sections, the numbers indicating the number of
+! bulk layers (if these total 9 it is the equivalent of setting extruded mesh levels
+! to 10).
+  Extruded Elements(2) = Integer 8 1
+! This line should ensure the sea level falls exactly on a node layer.
+  Extruded Limits(3)   = Real 0.0 #rhoi/rhow# 1.0
+! This line is like setting "extruded mesh ratio" separately for both parts.
+  Extruded Ratios(2)   = Real 4.0 1.0
 End
 
 !--------------------------------------------------------
