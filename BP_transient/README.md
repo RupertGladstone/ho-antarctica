@@ -10,7 +10,7 @@ The BP_SpinUp input file is just spinning up the BP flow solution from zero usin
 The BP_Trans input file restarts from the spun up solution and evolves through time, so the geometry and groundedmask evolution is turned on. This is probably a good starting point for ISMIP7 simulations. I have put some notes in for things you need to add (search “TODO” in the .sif).
 
 Several further sif files have been added, used in various tests. Current recommendation for the transient simulations is BP_T10b_L10.sif.
-This incorporates the modified setting for mesh sxtrusion to ensure
+This incorporates the modified setting for mesh extrusion to ensure that a node layer sits exactly at sea level for floating ice, avoiding systematic bias in the integrated ice front force balance.
 
 Note that both of the above are "transient", but the first one starts with uniform zero velocity and just runs one timestep with no geometry evolution. The second one uses the velocity from the first one and runs forward in time (albeit without ISMIP7 forcing).
 
