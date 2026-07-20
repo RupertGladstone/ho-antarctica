@@ -9,6 +9,9 @@ The BP_SpinUp input file is just spinning up the BP flow solution from zero usin
 
 The BP_Trans input file restarts from the spun up solution and evolves through time, so the geometry and groundedmask evolution is turned on. This is probably a good starting point for ISMIP7 simulations. I have put some notes in for things you need to add (search “TODO” in the .sif).
 
+Several further sif files have been added, used in various tests. Current recommendation for the transient simulations is BP_T10b_L10.sif.
+This incorporates the modified setting for mesh sxtrusion to ensure
+
 Note that both of the above are "transient", but the first one starts with uniform zero velocity and just runs one timestep with no geometry evolution. The second one uses the velocity from the first one and runs forward in time (albeit without ISMIP7 forcing).
 
 
@@ -24,6 +27,12 @@ This was with 12 extruded mesh levels with thinner layers near the bed. I expect
 We can't increase the resources on an existing LUMI project. If we need more core hours, which we do, we need to open a new project. We should do this sooner rather than later, to make sure we have sufficient resource for the production runs. 
 
 We currently have around 3000000 core hours left on project 462001251. 3000k / 200k = approx. 15 full simulations. Given that there are other users on this project, the cheat sheet lists 6 runs this long (as well as other runs), we want to do some tier 2 and 3 runs, we'll certainly waste some hours getting it wrong, we most definitely need a new project for this.
+
+Update 20th July 2026: Project 462001251 is rapidly diminishing. Down to 1200000 core hours.
+
+Update 20th July 2026: Project 462001629 is for ISMIP7 runs. It is waiting approval from CSC.
+
+Update 20th July 2026: Project 462001627 is for idealised simulations, no ISMIP7, but can be temporarily used if 462001251 is empty before 462001629 becomes available.
 
 
 #### Outputting
@@ -42,13 +51,18 @@ I found the GCR and ILUT settings pretty optimal for linear solve for the spin u
 
 ## Updated code
 
-The version of the BP solver here has a few small (but two of them are important) changes compared to the repository version:
+The version of the BP solver here has a few small (but two of them are important) changes compared to the repository version.
 
-The flow solution is now updated every nonlinear iteration instead of after nonlinear convergence. This is because the sliding code quietly looks for “flow solution” by default (it would need a  code change to let it use a 2 dofs variable other than the SSA velocity), so updating the flow solution only after nonlinear convergence removes the nonlinear sliding – flow speed feedback from the friction parameterisation.
+More complete summary of changes here:
+https://github.com/RupertGladstone/BlIP/blob/main/HydrostaticNSVec_local_changes.txt
+
+
+The "flow solution" is now updated every nonlinear iteration instead of after nonlinear convergence. This is because the sliding code quietly looks for “flow solution” by default (it would need a  code change to let it use a 2 dofs variable other than the SSA velocity), so updating the flow solution only after nonlinear convergence removes the nonlinear sliding – flow speed feedback from the friction parameterisation.
 
 Thomas implemented an optional velocity limit, which was applied to flow solution. I have switched this from the flow solution to the vertically averaged velocity, since this is the property used by the thickness solver to evolve the ice thickness. Now that we have more stable behaviour the limit is probably not needed anyway.
 
-There's a new optional "minimum viscosity" parameter (which gets applied to effective viscosity at run time, not the "viscosity" material property). This is currently needed because of the small region of very low alpha which otherwise goes unstable. You might be able to comment this out at some point.
+There's a new optional "minimum viscosity" parameter (which gets applied to effective viscosity at run time, not the "viscosity" material property). This is currently needed because of the small region of very low alpha which otherwise goes unstable. You might be able to comment this out at some point. <br>
+Update 20th July 2026: I don't think this is wokring properly, and my latest suggested sif doesn't use it. I recommend NOT to use this feature.
 
 There are a couple of minor checks on array bounds and nans that don’t get triggered, but who knows, maybe one day we’ll be glad of them…
 
